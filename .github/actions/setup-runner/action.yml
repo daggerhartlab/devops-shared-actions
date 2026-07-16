@@ -1,0 +1,223 @@
+name: "Setup Runner"
+description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Drush, Acquia CLI, OpenVPN, and Pandoc as needed, as a composite action"
+
+# When this action is used in a workflow, the workflow can pass in values for these inputs.
+inputs:
+  # Git
+  configure_git_identity:
+    description: 'Whether to set git user.name/user.email from the last commit author. Needed before some Pantheon terminus build:env:push flows that create a commit; leave unset if the workflow never commits.'
+    required: false
+    default: ''
+
+  # SSH
+  ssh_key:
+    description: 'SSH Private key in the PEM format.'
+    required: false
+  ssh_config:
+    description: 'Contents of the ssh/config file.'
+    required: false
+    # These can be chained together as needed using \n as a separator based on the specific workflow needs
+    default: "Host *.drush.in\n  StrictHostKeyChecking no"
+    #default: "Host *.github.com\n  StrictHostKeyChecking no"
+    #default: "Host *.acquia.com\n  StrictHostKeyChecking no"
+    #default: "Host *.acquia-sites.com\n  StrictHostKeyChecking no"
+  known_hosts:
+    description: 'Known hosts file contents. Mainly just needs to be a blank space so the file can be created.'
+    required: false
+    default: ' '
+
+  # PHP
+  php_version:
+    description: 'PHP version'
+    required: false
+    default: '8.3'
+  php_extensions:
+    description: 'Extensions to install for PHP build'
+    required: false
+    # Also may include: curl, mbstring, mysql, xml
+    default: gd
+  composer_version:
+    description: 'Composer version'
+    required: false
+    default: 'v2'
+
+  # Node
+  node_version:
+    description: 'Node.js version'
+    required: false
+    default: '20.x'
+
+  # Pantheon
+  pantheon_machine_token:
+    description: 'Pantheon Machine Token for Terminus.'
+    required: false
+    default: ''
+  terminus_version:
+    description: 'Terminus version number in composer dependency format.'
+    required: false
+    default: '^3.0'
+  terminus_build_tools_version:
+    description: 'Terminus build tools version number in composer dependency format.'
+    required: false
+    default: '^3.0'
+
+  # Drupal
+  install_drush:
+    description: 'Whether to install Drush. This is likely only necessary for old versions of Drupal.'
+    required: false
+    default: ''
+  drush_version:
+    description: 'Drush version'
+    required: false
+    default: '^9'
+  acli_version:
+    description: 'Acquia CLI version - https://github.com/acquia/cli'
+    required: false
+    default: '1.30.1'
+  acli_key:
+    description: 'Acquia CLI key'
+    required: false
+    default: ''
+  acli_secret:
+    description: 'Acquia CLI secret'
+    required: false
+    default: ''
+
+  # OpenVPN
+  install_openvpn:
+    description: 'Whether to install OpenVPN'
+    required: false
+    default: ''
+
+  # Pandoc
+  install_pandoc:
+    description: 'Whether to install Pandoc'
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: 'Prepare Git'
+      id: prepare-git
+      if: ${{ inputs.configure_git_identity != '' }}
+      shell: bash
+      run: |
+        git config user.name "$(git --no-pager log --format=format:'%an' -n 1)"
+        git config user.email "$(git --no-pager log --format=format:'%ae' -n 1)"
+
+    - name: 'Setup SSH'
+      if: ${{ inputs.ssh_key && inputs.ssh_config }}
+      uses: shimataro/ssh-key-action@87a8f067114a8ce263df83e9ed5c849953548bc3 # v2.8.1
+      with:
+        key: ${{ inputs.ssh_key }}
+        config: ${{ inputs.ssh_config }}
+        known_hosts: ${{ inputs.known_hosts }}
+
+    - name: 'Setup Node'
+      if: ${{ inputs.node_version }}
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: 'Setup PHP'
+      if: ${{ inputs.php_version != '' }}
+      uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2 (2.37.2)
+      with:
+        php-version: ${{ inputs.php_version }}
+        extensions: ${{ inputs.php_extensions }}
+        tools: composer:${{ inputs.composer_version }}
+
+    # Composer caching to speed up installation of composer packages.
+    - name: 'Get Composer Cache Directory'
+      if: ${{ inputs.php_version != '' }}
+      id: composer-cache
+      shell: bash
+      run: |
+        echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+    - name: 'Utilize Composer Cache Directory'
+      if: ${{ inputs.php_version != '' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-composer-
+
+    # Pantheon
+    - name: 'Installing Terminus'
+      if: ${{ inputs.pantheon_machine_token && inputs.terminus_version }}
+      shell: bash
+      env:
+        PANTHEON_MACHINE_TOKEN: ${{ inputs.pantheon_machine_token }}
+      run: |
+        composer global require pantheon-systems/terminus:${{ inputs.terminus_version }} --no-audit
+        terminus auth:login --machine-token="$PANTHEON_MACHINE_TOKEN"
+
+    # Install additional terminus build tools to simplify the work required to push code to pantheon.
+    # https://github.com/pantheon-systems/terminus-build-tools-plugin
+    - name: 'Install Terminus build tools'
+      if: ${{ inputs.pantheon_machine_token && inputs.terminus_version && inputs.terminus_build_tools_version }}
+      shell: bash
+      run: |
+        terminus self:plugin:install terminus-build-tools-plugin
+        terminus | grep build
+
+    # Drush
+    - name: Install Drush globally
+      id: drush
+      if: ${{ inputs.install_drush != '' }}
+      shell: bash
+      run: |
+        composer global require drush/drush:${{ inputs.drush_version }}
+        ln -s ~/.composer/vendor/bin/drush /usr/local/bin
+
+    # Acquia CLI
+    - name: Install Acquia CLI
+      id: acli
+      if: ${{ inputs.acli_key && inputs.acli_secret }}
+      shell: bash
+      env:
+        ACLI_KEY: ${{ inputs.acli_key }}
+        ACLI_SECRET: ${{ inputs.acli_secret }}
+      run: |
+        cd /tmp && curl -OL https://github.com/acquia/cli/releases/download/${{ inputs.acli_version }}/acli.phar && chmod +x acli.phar && mv acli.phar /usr/local/bin/acli
+        acli auth:login --key="$ACLI_KEY" --secret="$ACLI_SECRET"
+
+    # OpenVPN
+    - name: Install OpenVPN
+      id: openvpn
+      if: ${{ inputs.install_openvpn != '' }}
+      shell: bash
+      run: |
+        sudo apt update
+        sudo apt install -y openvpn openvpn-systemd-resolved
+
+    # Pandoc
+    - name: Pandoc
+      id: pandoc
+      if: ${{ inputs.install_pandoc != '' }}
+      shell: bash
+      run: |
+        wget https://github.com/jgm/pandoc/releases/download/2.18/pandoc-2.18-1-amd64.deb
+        sudo dpkg -i pandoc-2.18-1-amd64.deb  # install an official pandoc release (update version as appropriate)
+
+    # Callout versions of things we installed
+    - name: Versions
+      shell: bash
+      run: |
+        which composer
+        composer --version
+        which php
+        php --version
+        if command -v terminus >/dev/null 2>&1; then
+          which terminus
+          terminus --version
+        else
+          echo "terminus not installed (no pantheon_machine_token provided)"
+        fi
+        which node
+        node --version
+        which npm
+        npm --version
