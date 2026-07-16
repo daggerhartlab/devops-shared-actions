@@ -157,11 +157,23 @@ runs:
 
     # Install additional terminus build tools to simplify the work required to push code to pantheon.
     # https://github.com/pantheon-systems/terminus-build-tools-plugin
+    #
+    # This plugin pins old, frozen transitive dependencies (guzzle, symfony/process,
+    # twig, psysh, etc.) that now carry published security advisories. Composer's
+    # advisory-blocking resolver policy refuses to install them by default - unlike
+    # --no-audit (which only suppresses the post-install report), this is a resolver
+    # constraint Terminus's own internal `composer require`/`update` call hits, so it
+    # can only be disabled via global Composer config, not a flag we control directly.
+    # The affected packages install into Terminus's own isolated plugin-dependency
+    # sandbox, not this project's vendor/, so this is scoped tightly (set, install,
+    # restore) rather than left disabled for the rest of the job.
     - name: 'Install Terminus build tools'
       if: ${{ inputs.pantheon_machine_token && inputs.terminus_version && inputs.terminus_build_tools_version }}
       shell: bash
       run: |
+        composer config -g policy.advisories.block false
         terminus self:plugin:install terminus-build-tools-plugin
+        composer config -g policy.advisories.block true
         terminus | grep build
 
     # Drush
