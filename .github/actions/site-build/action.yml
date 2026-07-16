@@ -1,0 +1,61 @@
+name: "Site build"
+description: "Builds site dependencies for deployment: Composer (no-dev), an optional Laravel Mix theme build, and optional artifact-repo prep (e.g. Pantheon, Acquia)."
+
+inputs:
+  laravel_mix_theme_path:
+    description: 'Path (relative to repo root) to a theme directory that uses Laravel Mix, e.g. web/themes/custom/my_theme. If set, runs `npm ci` and `npx mix --production` in that directory, then removes node_modules. Leave unset to skip the theme build entirely.'
+    required: false
+    default: ''
+  artifact_repo_gitignore:
+    description: 'Path (relative to repo root) to a .gitignore file tailored for a git-based artifact deploy target (e.g. Pantheon, Acquia) - one that commits vendor/ and web/core rather than ignoring them. If set, this file replaces the repo''s default .gitignore. Leave unset to skip this step entirely.'
+    required: false
+    default: ''
+  artifact_repo_cleanup_paths:
+    description: 'Newline-separated list of paths (relative to repo root, no leading ./) to scan for nested .git directories and remove, e.g. "web\nvendor" - useful before pushing to a git-based artifact deploy target (e.g. Pantheon, Acquia), which rejects nested repos. Leave unset to skip this step entirely.'
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    # Build: Composer
+    - name: Install Dependencies
+      shell: bash
+      run: |
+        composer install --optimize-autoloader --no-dev --prefer-dist --no-progress --no-suggest
+
+    # Build: Laravel Mix theme
+    - name: Build Laravel Mix theme
+      if: ${{ inputs.laravel_mix_theme_path != '' }}
+      shell: bash
+      env:
+        THEME_PATH: ${{ inputs.laravel_mix_theme_path }}
+      run: |
+        cd "$THEME_PATH"
+        npm ci
+        npx mix --production
+        rm -fr node_modules
+
+    ## Replace .gitignore for artifact repo
+    - name: Replace .gitignore for artifact repo
+      if: ${{ inputs.artifact_repo_gitignore != '' }}
+      shell: bash
+      env:
+        ARTIFACT_GITIGNORE: ${{ inputs.artifact_repo_gitignore }}
+      run: |
+        cp "$ARTIFACT_GITIGNORE" .gitignore
+
+    ## Remove nested .git directories
+    # Git-based artifact deploy targets (Pantheon, Acquia, etc.) will not allow
+    # another repo to live inside ours, so we delete any ".git" folders we
+    # can find that aren't in the repo root.
+    - name: Remove nested .git directories
+      if: ${{ inputs.artifact_repo_cleanup_paths != '' }}
+      shell: bash
+      env:
+        ARTIFACT_CLEANUP_PATHS: ${{ inputs.artifact_repo_cleanup_paths }}
+      run: |
+        while IFS= read -r cleanup_path; do
+          [ -z "$cleanup_path" ] && continue
+          find "$cleanup_path" -type d -name ".git" | xargs -r rm -fr
+        done <<< "$ARTIFACT_CLEANUP_PATHS"
