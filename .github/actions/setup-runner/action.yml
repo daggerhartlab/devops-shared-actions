@@ -1,9 +1,9 @@
 name: "Setup Runner"
-description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Drush, Acquia CLI, WP-CLI, OpenVPN, and Pandoc as needed, as a composite action"
+description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Acquia CLI, WP-CLI, OpenVPN, and Pandoc as needed, as a composite action"
 
 # When this action is used in a workflow, the workflow can pass in values for these inputs.
 #
-# On/off flags below (configure_git_identity, install_drush, install_openvpn,
+# On/off flags below (configure_git_identity, install_wp_cli, install_openvpn,
 # install_pandoc) accept 'true' to enable. Unset, '', 'false', '0', 'no' and
 # 'off' all disable - composite action inputs are always strings, so a bare
 # `!= ''` test would treat the string 'false' as enabled. Comparisons in GitHub
@@ -67,15 +67,7 @@ inputs:
     required: false
     default: '^3.0'
 
-  # Drupal
-  install_drush:
-    description: "Whether to install Drush. This is likely only necessary for old versions of Drupal. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
-    required: false
-    default: ''
-  drush_version:
-    description: 'Drush version'
-    required: false
-    default: '^9'
+  # Acquia
   acli_version:
     description: 'Acquia CLI version - https://github.com/acquia/cli'
     required: false
@@ -193,17 +185,6 @@ runs:
         composer config -g policy.advisories.block true
         terminus | grep build
 
-    # Drush
-    - name: Install Drush globally
-      id: drush
-      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_drush) }}
-      shell: bash
-      env:
-        DRUSH_VERSION: ${{ inputs.drush_version }}
-      run: |
-        composer global require "drush/drush:$DRUSH_VERSION"
-        ln -s ~/.composer/vendor/bin/drush /usr/local/bin
-
     # Acquia CLI
     - name: Install Acquia CLI
       id: acli
@@ -275,7 +256,6 @@ runs:
         show node --version
         show npm --version
         show terminus --version
-        show drush --version
         show wp --version --allow-root
         show acli --version
         show pandoc --version

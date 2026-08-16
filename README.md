@@ -15,7 +15,7 @@ every example below uses.
 ## Actions in this repo
 
 - [`setup-runner`](#setup-runner) — installs SSH, Node, PHP/Composer,
-  Pantheon Terminus, Drush, Acquia CLI, WP-CLI, OpenVPN, Pandoc as needed.
+  Pantheon Terminus, Acquia CLI, WP-CLI, OpenVPN, Pandoc as needed.
 - [`site-build`](#site-build) — builds a deployable artifact: Composer
   (no-dev), an optional Laravel Mix theme build, and optional git-based
   artifact-repo prep.
@@ -32,13 +32,28 @@ PHP/Composer and Node always install — their version inputs have non-empty
 defaults (`php_version: '8.3'`, `node_version: '20.x'`), so their steps run
 on every consumer. Pass an empty string (`php_version: ''`) to skip one.
 
-Every other tool — Terminus, Drush, Acquia CLI, WP-CLI, OpenVPN, Pandoc —
-only runs if its relevant input is provided.
+Every other tool — Terminus, Acquia CLI, WP-CLI, OpenVPN, Pandoc — only runs
+if its relevant input is provided.
 
-The on/off flags (`configure_git_identity`, `install_drush`,
-`install_wp_cli`, `install_openvpn`, `install_pandoc`) take `'true'` to
-enable. Omitting them, or passing `'false'`, `'0'`, `'no'`, or `'off'`,
-disables them — so `install_drush: 'false'` does what it looks like it does.
+The on/off flags (`configure_git_identity`, `install_wp_cli`,
+`install_openvpn`, `install_pandoc`) take `'true'` to enable. Omitting them,
+or passing `'false'`, `'0'`, `'no'`, or `'off'`, disables them — so
+`install_wp_cli: 'false'` does what it looks like it does.
+
+### No Drush
+
+`setup-runner` deliberately does not install Drush. Modern Drupal sites get
+Drush from their own `composer.json`, so `site-build`'s `composer install`
+already puts it at `vendor/bin/drush` — call it from there.
+
+The `install_drush`/`drush_version` inputs were removed because they could
+not do their job: Composer's advisory-blocking policy rejects every Drush 8,
+9, and 10 release (their pinned `symfony/yaml` and `symfony/process`
+constraints all resolve to versions with published advisories), and those are
+exactly the versions a legacy site would want. Only Drush 11+ installs
+cleanly — and any site new enough for Drush 11 already has its own. For a
+Drupal 7 site that genuinely needs Drush 8, use the Drush 8 phar or a
+project-local Composer install rather than a global `composer require`.
 
 ### Basic PHP/Composer setup (no deployment)
 
