@@ -169,3 +169,85 @@ jobs:
 
       - name: Reached the end without failing
         run: echo "setup-runner completed with all version inputs empty"
+
+  wp-core-update:
+    name: WP core update
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: '8.3'
+          install_wp_cli: 'true'
+
+      # A deliberately out-of-date WordPress inside the workspace, so the
+      # action runs exactly as it would against a real site checkout. dry_run
+      # stops it before any push or PR.
+      - name: Build an out-of-date WordPress fixture
+        run: |
+          wp core download --version=6.7 --path=wpfix --skip-content
+          echo "fixture at: $(wp core version --path=wpfix | tail -n 1)"
+
+      - name: Run wp-core-update (update path)
+        id: update
+        uses: ./.github/actions/wp-core-update
+        with:
+          wp_path: wpfix
+          dry_run: 'true'
+
+      - name: Assert the update path
+        env:
+          UPDATED: ${{ steps.update.outputs.updated }}
+          FROM: ${{ steps.update.outputs.from_version }}
+          TO: ${{ steps.update.outputs.to_version }}
+          BRANCH: ${{ steps.update.outputs.branch }}
+          PR_URL: ${{ steps.update.outputs.pr_url }}
+        run: |
+          fail=0
+          [ "$UPDATED" = "true" ] || { echo "::error::expected updated=true, got '$UPDATED'"; fail=1; }
+          [ "$FROM" = "6.7" ]     || { echo "::error::expected from_version=6.7, got '$FROM'"; fail=1; }
+          [ -n "$TO" ]            || { echo "::error::to_version is empty"; fail=1; }
+          [ "$BRANCH" = "wp-core-update/${TO}" ] || { echo "::error::branch '$BRANCH' does not match wp-core-update/${TO}"; fail=1; }
+          # dry_run must not have opened anything.
+          [ -z "$PR_URL" ]        || { echo "::error::dry_run still produced a PR: $PR_URL"; fail=1; }
+          # The commit must exist locally, attributed to the actor.
+          author=$(git --no-pager log -1 --format='%an <%ae>')
+          echo "commit author: $author"
+          case "$author" in
+            *"users.noreply.github.com"*) : ;;
+            *) echo "::error::commit not attributed to a GitHub identity: $author"; fail=1 ;;
+          esac
+          # And the fixture must really be on the new version.
+          actual=$(wp core version --path=wpfix | tail -n 1)
+          [ "$actual" = "$TO" ] || { echo "::error::fixture reports $actual, expected $TO"; fail=1; }
+          echo "updated ${FROM} -> ${TO} on branch ${BRANCH}"
+          exit "$fail"
+
+      # wp-content must survive an update untouched - that is what
+      # --skip-content is protecting.
+      - name: Assert wp-content was not clobbered
+        run: |
+          touched=$(git diff --cached --name-only | grep -c '^wpfix/wp-content/' || true)
+          echo "wp-content files staged: $touched"
+          [ "$touched" -eq 0 ] || { echo "::error::the update touched $touched wp-content files"; exit 1; }
+
+      # Running again with nothing new available must be a clean no-op, not a
+      # failure and not an empty PR.
+      - name: Run wp-core-update (no-op path)
+        id: noop
+        uses: ./.github/actions/wp-core-update
+        with:
+          wp_path: wpfix
+          dry_run: 'true'
+
+      - name: Assert the no-op path
+        env:
+          UPDATED: ${{ steps.noop.outputs.updated }}
+          BRANCH: ${{ steps.noop.outputs.branch }}
+        run: |
+          fail=0
+          [ "$UPDATED" = "false" ] || { echo "::error::expected updated=false on a current install, got '$UPDATED'"; fail=1; }
+          [ -z "$BRANCH" ]         || { echo "::error::no-op still produced a branch: $BRANCH"; fail=1; }
+          echo "no-op path clean"
+          exit "$fail"
