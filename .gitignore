@@ -1,0 +1,19 @@
+# This repo holds only composite action definitions and docs - there is no
+# build step and nothing generated, so this file exists to keep local cruft
+# out rather than to ignore build output.
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local env / secrets.
+.env
+.env.*
+*.pem
+*.key

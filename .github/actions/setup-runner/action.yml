@@ -2,10 +2,16 @@ name: "Setup Runner"
 description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Drush, Acquia CLI, OpenVPN, and Pandoc as needed, as a composite action"
 
 # When this action is used in a workflow, the workflow can pass in values for these inputs.
+#
+# On/off flags below (configure_git_identity, install_drush, install_openvpn,
+# install_pandoc) accept 'true' to enable. Unset, '', 'false', '0', 'no' and
+# 'off' all disable - composite action inputs are always strings, so a bare
+# `!= ''` test would treat the string 'false' as enabled. Comparisons in GitHub
+# Actions expressions are case-insensitive, so 'False'/'FALSE' work too.
 inputs:
   # Git
   configure_git_identity:
-    description: 'Whether to set git user.name/user.email from the last commit author. Needed before some Pantheon terminus build:env:push flows that create a commit; leave unset if the workflow never commits.'
+    description: "Whether to set git user.name/user.email from the last commit author. Needed before some Pantheon terminus build:env:push flows that create a commit; leave unset if the workflow never commits. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
 
@@ -63,7 +69,7 @@ inputs:
 
   # Drupal
   install_drush:
-    description: 'Whether to install Drush. This is likely only necessary for old versions of Drupal.'
+    description: "Whether to install Drush. This is likely only necessary for old versions of Drupal. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
   drush_version:
@@ -85,13 +91,13 @@ inputs:
 
   # OpenVPN
   install_openvpn:
-    description: 'Whether to install OpenVPN'
+    description: "Whether to install OpenVPN. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
 
   # Pandoc
   install_pandoc:
-    description: 'Whether to install Pandoc'
+    description: "Whether to install Pandoc. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
 
@@ -100,7 +106,7 @@ runs:
   steps:
     - name: 'Prepare Git'
       id: prepare-git
-      if: ${{ inputs.configure_git_identity != '' }}
+      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.configure_git_identity) }}
       shell: bash
       run: |
         git config user.name "$(git --no-pager log --format=format:'%an' -n 1)"
@@ -151,8 +157,9 @@ runs:
       shell: bash
       env:
         PANTHEON_MACHINE_TOKEN: ${{ inputs.pantheon_machine_token }}
+        TERMINUS_VERSION: ${{ inputs.terminus_version }}
       run: |
-        composer global require pantheon-systems/terminus:${{ inputs.terminus_version }} --no-audit
+        composer global require "pantheon-systems/terminus:$TERMINUS_VERSION" --no-audit
         terminus auth:login --machine-token="$PANTHEON_MACHINE_TOKEN"
 
     # Install additional terminus build tools to simplify the work required to push code to pantheon.
@@ -179,10 +186,12 @@ runs:
     # Drush
     - name: Install Drush globally
       id: drush
-      if: ${{ inputs.install_drush != '' }}
+      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_drush) }}
       shell: bash
+      env:
+        DRUSH_VERSION: ${{ inputs.drush_version }}
       run: |
-        composer global require drush/drush:${{ inputs.drush_version }}
+        composer global require "drush/drush:$DRUSH_VERSION"
         ln -s ~/.composer/vendor/bin/drush /usr/local/bin
 
     # Acquia CLI
@@ -193,14 +202,15 @@ runs:
       env:
         ACLI_KEY: ${{ inputs.acli_key }}
         ACLI_SECRET: ${{ inputs.acli_secret }}
+        ACLI_VERSION: ${{ inputs.acli_version }}
       run: |
-        cd /tmp && curl -OL https://github.com/acquia/cli/releases/download/${{ inputs.acli_version }}/acli.phar && chmod +x acli.phar && mv acli.phar /usr/local/bin/acli
+        cd /tmp && curl -OL "https://github.com/acquia/cli/releases/download/$ACLI_VERSION/acli.phar" && chmod +x acli.phar && mv acli.phar /usr/local/bin/acli
         acli auth:login --key="$ACLI_KEY" --secret="$ACLI_SECRET"
 
     # OpenVPN
     - name: Install OpenVPN
       id: openvpn
-      if: ${{ inputs.install_openvpn != '' }}
+      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_openvpn) }}
       shell: bash
       run: |
         sudo apt update
@@ -209,7 +219,7 @@ runs:
     # Pandoc
     - name: Pandoc
       id: pandoc
-      if: ${{ inputs.install_pandoc != '' }}
+      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_pandoc) }}
       shell: bash
       run: |
         wget https://github.com/jgm/pandoc/releases/download/2.18/pandoc-2.18-1-amd64.deb

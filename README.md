@@ -6,11 +6,11 @@ repos.
 
 ## Versioning
 
-Once this repo has its first tagged release, pin consumers to a major
-version tag (e.g. `@v1`), not `@main` — this repo pins its own third-party
-action dependencies to commit SHAs for exactly that reason (see
-`.github/actions/setup-runner/action.yml`), and consumers should extend the
-same discipline to this repo.
+Pin consumers to a major version tag (e.g. `@v1`), not `@main` — this repo
+pins its own third-party action dependencies to commit SHAs for exactly
+that reason (see `.github/actions/setup-runner/action.yml`), and consumers
+should extend the same discipline to this repo. `v1` is tagged and is what
+every example below uses.
 
 ## Actions in this repo
 
@@ -28,7 +28,17 @@ patterns and the gotchas we've already hit.
 
 ## `setup-runner`
 
-Each tool only runs if its relevant input is provided.
+PHP/Composer and Node always install — their version inputs have non-empty
+defaults (`php_version: '8.3'`, `node_version: '20.x'`), so their steps run
+on every consumer. Pass an empty string (`php_version: ''`) to skip one.
+
+Every other tool — Terminus, Drush, Acquia CLI, OpenVPN, Pandoc — only runs
+if its relevant input is provided.
+
+The on/off flags (`configure_git_identity`, `install_drush`,
+`install_openvpn`, `install_pandoc`) take `'true'` to enable. Omitting them,
+or passing `'false'`, `'0'`, `'no'`, or `'off'`, disables them — so
+`install_drush: 'false'` does what it looks like it does.
 
 ### Basic PHP/Composer setup (no deployment)
 
@@ -91,26 +101,39 @@ jobs:
             web
             vendor
 
+      # setup-runner already ran `terminus auth:login` with the machine
+      # token above, and this is the same job — no need to log in again.
       - name: Push to Pantheon
         env:
           pantheon_site: 'my-site'
           pantheon_env: 'dev'
-          PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
         run: |
-          terminus auth:login --machine-token="$PANTHEON_MACHINE_TOKEN"
           terminus build:env:push $pantheon_site.$pantheon_env --message="CI Deployment" -v
 ```
 
 Note: never interpolate `${{ secrets.* }}` directly into a `run:` shell
-string (e.g. `--machine-token=${{ secrets.X }}`) — pass it through `env:`
-and reference it as a shell variable instead, as above. This avoids
-GitHub's documented script-injection risk for expression interpolation in
-shell blocks.
+string. Pass it through `env:` and reference it as a shell variable:
+
+```yaml
+        env:
+          PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        run: |
+          terminus auth:login --machine-token="$PANTHEON_MACHINE_TOKEN"   # good
+          terminus auth:login --machine-token=${{ secrets.X }}            # bad
+```
+
+This avoids GitHub's documented script-injection risk for expression
+interpolation in shell blocks.
 
 ### `ssh_config` examples by host
 
+The SSH setup step only runs when **both** `ssh_key` and `ssh_config` are
+set. `ssh_config` on its own does nothing — if you override it without also
+passing `ssh_key`, no SSH config is written at all and the step is silently
+skipped.
+
 `ssh_config`'s default (`Host *.drush.in\n  StrictHostKeyChecking no`)
-covers Pantheon. For other hosts, override it:
+covers Pantheon. For other hosts, override it (alongside `ssh_key`):
 
 **Acquia:**
 ```yaml
@@ -137,6 +160,9 @@ Multiple hosts can be chained in one value:
 
 ### Deploying to Acquia
 
+Acquia CLI authenticates with its own key/secret, so this needs no SSH
+setup:
+
 ```yaml
 - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
   with:
@@ -145,19 +171,27 @@ Multiple hosts can be chained in one value:
     acli_secret: ${{ secrets.ACQUIA_CLI_SECRET }}
 ```
 
+If you also push to Acquia over git, add **both** `ssh_key` and the Acquia
+`ssh_config` from the section above — neither works without the other.
+
 ---
 
 ## `site-build`
 
-Three independent, opt-in steps — each only runs if its own input is set,
-with no coupling between them:
+`composer install --no-dev` always runs. Three further steps are
+independently opt-in — each only runs if its own input is set, with no
+coupling between them:
 
 | Input | Step it enables |
 |---|---|
 | *(always runs)* | `composer install --no-dev` (production dependencies) |
-| `laravel_mix_theme_path` | `npm ci && npx mix --production` in that theme directory |
+| `laravel_mix_theme_path` | `npm ci && npx mix --production` in that theme directory, then deletes its `node_modules` |
 | `artifact_repo_gitignore` | Replace `.gitignore` with the given file |
 | `artifact_repo_cleanup_paths` | Remove nested `.git` directories under the given paths |
+
+Note the `node_modules` deletion: it keeps build-time dependencies out of
+the deployable artifact, but it also means any npm step you run *after*
+`site-build` in the same job has to reinstall first.
 
 ### Building a Laravel Mix theme only
 
