@@ -19,6 +19,8 @@ every example below uses.
 - [`site-build`](#site-build) — builds a deployable artifact: Composer
   (no-dev), an optional Laravel Mix theme build, and optional git-based
   artifact-repo prep.
+- [`wp-core-update`](#wp-core-update) — updates WordPress core files,
+  verifies them against WordPress.org checksums, and opens a PR.
 
 Both are composite actions; see each `action.yml` for the full,
 authoritative list of inputs and defaults. This README covers common usage
@@ -294,6 +296,84 @@ don't cost it again.
 
 ---
 
+## `wp-core-update`
+
+Updates WordPress core and opens a PR for review. Intended to be run by hand
+from the Actions tab when a site needs a core bump.
+
+```yaml
+name: Update WordPress core
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'WordPress version (blank = latest)'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+        with:
+          php_version: '8.3'
+          install_wp_cli: 'true'
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/wp-core-update@v1
+        with:
+          version: ${{ inputs.version }}
+          token: ${{ secrets.LABBY_GITHUB_TOKEN_GENERIC }}
+```
+
+The PR targets whichever branch you selected when dispatching the workflow,
+so `develop` and `master` sites both work without configuration. The branch
+is `wp-core-update/<version>`; re-running for the same version force-updates
+that branch and leaves the existing PR open.
+
+Outputs: `updated`, `from_version`, `to_version`, `branch`, `pr_url`.
+
+### Gotchas
+
+- **It updates files, not the database.** `wp core update` bootstraps
+  WordPress and therefore needs a database, which CI does not have — your
+  `wp-config.php` reads credentials from `wp-config-local.php` or
+  `PANTHEON_ENVIRONMENT`. This action uses `wp core download --force
+  --skip-content` instead, which replaces core files (and drops files the new
+  version no longer ships) without loading WordPress. The database half stays
+  where it already lives: `terminus wp ... core update-db` in your deploy
+  workflow, after the PR merges.
+
+- **Pass a PAT or the PR gets no CI.** A pull request opened with the default
+  `GITHUB_TOKEN` deliberately does not trigger other workflows, so the site's
+  own tests will not run on it. Pass a personal access token as `token` to get
+  checks. The same token is used for the push, since a push made with
+  `GITHUB_TOKEN` will not fire `pull_request: synchronize` either.
+
+- **Do not also pass `configure_git_identity` to `setup-runner`.** This action
+  sets the git identity to the person who ran the workflow (via
+  `<id>+<login>@users.noreply.github.com`, which is what links the commit to a
+  GitHub profile). `configure_git_identity` sets it from the last commit's
+  author instead, and whichever runs last wins.
+
+- **`wp-content` is left alone**, which means the default themes core bundles
+  (`twentytwentyfive` and friends) are not updated. That is the right default
+  — clobbering `wp-content` in a repo where themes and plugins are tracked
+  would be far worse — but those themes need updating separately.
+
+- **`wp_path` is usually unnecessary.** WP-CLI reads `path:` from a
+  `wp-cli.yml` in the working directory, which most of our WP repos already
+  have (`web/wp`, `wp`, or `web`). Only set `wp_path` when there is no
+  `wp-cli.yml` and core is not at the repo root.
+
+---
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -307,6 +387,7 @@ once `v1` is moved onto it.
 | `flag-semantics` | `install_wp_cli` across 9 values — `true`/`yes`/`1` install, `unset`/`false`/`FALSE`/`0`/`no`/`off` don't |
 | `all-tools` | Everything enabled at once; asserts each binary landed, git identity was set, and `wp_cli_version` was honored |
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
+| `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 
 Two things worth knowing if you extend this:
 

@@ -1,0 +1,275 @@
+name: "WP Core Update"
+description: "Updates WordPress core files, verifies them against WordPress.org checksums, and opens a pull request with the change."
+
+# Requires wp-cli on PATH - run setup-runner with install_wp_cli: 'true' first.
+#
+# Why `core download --force` and not `core update`:
+# `wp core update` bootstraps WordPress, which needs a database connection.
+# CI has no database (wp-config.php reads credentials from wp-config-local.php
+# or PANTHEON_ENVIRONMENT, neither of which exists on a runner). `core download
+# --force` replaces core files without loading WordPress, and prunes files that
+# are no longer part of core, so the result matches a clean install of the
+# target version. The database half of an update (`core update-db`) belongs in
+# the deploy workflow, against a real environment.
+inputs:
+  version:
+    description: 'Target WordPress version, e.g. 7.0.4. Leave unset to use the latest release from the WordPress.org API.'
+    required: false
+    default: ''
+  wp_path:
+    description: 'Path to the WordPress root, relative to the repo. Leave unset to let wp-cli resolve it from wp-cli.yml or the working directory.'
+    required: false
+    default: ''
+  token:
+    description: 'Token used to push the branch and open the PR. Leave unset to fall back to the workflow GITHUB_TOKEN - note that a PR opened with GITHUB_TOKEN does NOT trigger other workflows, so the PR will show no CI checks. Pass a PAT to get checks.'
+    required: false
+    default: ''
+  base_branch:
+    description: 'Branch the PR targets. Leave unset to use the ref the workflow ran from.'
+    required: false
+    default: ''
+  branch_prefix:
+    description: 'Prefix for the created branch. The branch is <prefix>/<target-version>.'
+    required: false
+    default: 'wp-core-update'
+  dry_run:
+    description: "Do everything except push the branch and open the PR. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+
+outputs:
+  updated:
+    description: "'true' if an update was applied, 'false' if core was already at the target version."
+    value: ${{ steps.resolve.outputs.updated }}
+  from_version:
+    description: 'The version core was on before this ran.'
+    value: ${{ steps.resolve.outputs.from_version }}
+  to_version:
+    description: 'The version core was updated to (or already at).'
+    value: ${{ steps.resolve.outputs.to_version }}
+  branch:
+    description: 'Name of the branch holding the update, empty when no update was needed.'
+    value: ${{ steps.resolve.outputs.branch }}
+  pr_url:
+    description: 'URL of the created or existing pull request, empty on a dry run or no-op.'
+    value: ${{ steps.pr.outputs.pr_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve current and target versions
+      id: resolve
+      shell: bash
+      env:
+        VERSION_INPUT: ${{ inputs.version }}
+        WP_PATH: ${{ inputs.wp_path }}
+        BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+      run: |
+        if ! command -v wp >/dev/null 2>&1; then
+          echo "::error::wp-cli not found on PATH. Run setup-runner with install_wp_cli: 'true' before this action."
+          exit 1
+        fi
+
+        wp_args=()
+        if [ -n "$WP_PATH" ]; then
+          wp_args+=("--path=$WP_PATH")
+        fi
+
+        # PHP notices and deprecations go to STDOUT, not stderr, so they land
+        # in front of the value we want. wp-cli always prints its result last,
+        # so take the final line and then insist it looks like a version.
+        from=$(wp core version "${wp_args[@]}" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+        if ! printf '%s' "$from" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
+          echo "::error::Could not read the current WordPress version (got: '${from}'). Check wp_path, or that wp-cli.yml points at the WordPress root."
+          exit 1
+        fi
+
+        if [ -n "$VERSION_INPUT" ]; then
+          to="$VERSION_INPUT"
+        else
+          to=$(curl -sf "https://api.wordpress.org/core/version-check/1.7/" | jq -r '.offers[0].current')
+        fi
+        if [ -z "$to" ] || [ "$to" = "null" ]; then
+          echo "::error::Could not determine the target WordPress version from the WordPress.org API."
+          exit 1
+        fi
+
+        echo "current=$from  target=$to"
+        {
+          echo "from_version=$from"
+          echo "to_version=$to"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$from" = "$to" ]; then
+          echo "WordPress core is already at $to - nothing to do."
+          {
+            echo "updated=false"
+            echo "branch="
+          } >> "$GITHUB_OUTPUT"
+        else
+          {
+            echo "updated=true"
+            echo "branch=${BRANCH_PREFIX}/${to}"
+          } >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Download core files
+      if: ${{ steps.resolve.outputs.updated == 'true' }}
+      shell: bash
+      env:
+        WP_PATH: ${{ inputs.wp_path }}
+        TARGET: ${{ steps.resolve.outputs.to_version }}
+      run: |
+        wp_args=()
+        if [ -n "$WP_PATH" ]; then
+          wp_args+=("--path=$WP_PATH")
+        fi
+        # --skip-content leaves wp-content alone: themes and plugins are the
+        # site's, not core's. --force overwrites existing core files and drops
+        # ones this version no longer ships.
+        wp core download --version="$TARGET" --force --skip-content "${wp_args[@]}"
+
+    - name: Verify the update
+      if: ${{ steps.resolve.outputs.updated == 'true' }}
+      shell: bash
+      env:
+        WP_PATH: ${{ inputs.wp_path }}
+        TARGET: ${{ steps.resolve.outputs.to_version }}
+      run: |
+        wp_args=()
+        if [ -n "$WP_PATH" ]; then
+          wp_args+=("--path=$WP_PATH")
+        fi
+
+        # Primary check: every core file matches WordPress.org's published
+        # checksums for this version.
+        wp core verify-checksums --version="$TARGET" "${wp_args[@]}"
+
+        # Cheap corroborating checks that need nothing external.
+        actual=$(wp core version "${wp_args[@]}" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+        if [ "$actual" != "$TARGET" ]; then
+          echo "::error::Expected WordPress $TARGET after download, but core reports $actual."
+          exit 1
+        fi
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "::error::Version went to $TARGET but the working tree is clean - no files changed, which should be impossible."
+          exit 1
+        fi
+        echo "Verified: core is $TARGET and the working tree has changes to commit."
+
+    - name: Commit as the workflow actor
+      if: ${{ steps.resolve.outputs.updated == 'true' }}
+      shell: bash
+      env:
+        ACTOR: ${{ github.actor }}
+        ACTOR_ID: ${{ github.actor_id }}
+        BRANCH: ${{ steps.resolve.outputs.branch }}
+        FROM: ${{ steps.resolve.outputs.from_version }}
+        TARGET: ${{ steps.resolve.outputs.to_version }}
+      run: |
+        # The <id>+<login>@users.noreply.github.com form is what links a commit
+        # back to a GitHub profile, so the update is attributed to whoever ran
+        # the workflow. Do NOT also pass configure_git_identity to setup-runner:
+        # that sets the identity from the last commit's author and would win or
+        # lose depending on step order.
+        git config user.name "$ACTOR"
+        git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
+
+        git switch -c "$BRANCH"
+        git add -A
+
+        # Guard against staging the wrong thing: a core update must always
+        # touch version.php. If it didn't, wp_path is wrong or the download
+        # landed somewhere unexpected.
+        if ! git diff --cached --name-only | grep -q "wp-includes/version.php"; then
+          echo "::error::Staged changes do not include wp-includes/version.php - refusing to commit."
+          exit 1
+        fi
+
+        echo "staged: $(git diff --cached --shortstat)"
+        git commit -m "Update WordPress core ${FROM} -> ${TARGET}"
+        git --no-pager log -1 --format='committed %h by %an <%ae>'
+
+    - name: Push the branch
+      if: ${{ steps.resolve.outputs.updated == 'true' && contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token || github.token }}
+        BRANCH: ${{ steps.resolve.outputs.branch }}
+        REPO: ${{ github.repository }}
+      run: |
+        # Set the remote explicitly so the chosen token is what actually
+        # authenticates the push, rather than whatever credentials
+        # actions/checkout happened to persist. This matters: a push made with
+        # GITHUB_TOKEN does not fire pull_request:synchronize, so CI would stay
+        # silent on re-runs.
+        git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+        git push --force-with-lease origin "$BRANCH"
+
+    - name: Open or update the pull request
+      id: pr
+      if: ${{ steps.resolve.outputs.updated == 'true' && contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        BRANCH: ${{ steps.resolve.outputs.branch }}
+        BASE: ${{ inputs.base_branch || github.ref_name }}
+        FROM: ${{ steps.resolve.outputs.from_version }}
+        TARGET: ${{ steps.resolve.outputs.to_version }}
+      run: |
+        existing=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')
+        if [ -n "$existing" ]; then
+          # The force-push above already refreshed the PR's diff.
+          echo "Updated existing pull request: $existing"
+          echo "pr_url=$existing" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        body=$(cat <<EOF
+        Updates WordPress core from \`${FROM}\` to \`${TARGET}\`.
+
+        Core files were replaced with \`wp core download --force --skip-content\`
+        and verified against WordPress.org's published checksums for
+        \`${TARGET}\`. \`wp-content\` is untouched.
+
+        Note that this is the file half of the update only. The database half
+        (\`wp core update-db\`) runs against the real environment as part of the
+        deploy, after this merges.
+        EOF
+        )
+        url=$(gh pr create \
+          --base "$BASE" \
+          --head "$BRANCH" \
+          --title "Update WordPress core ${FROM} -> ${TARGET}" \
+          --body "$body")
+        echo "Opened pull request: $url"
+        echo "pr_url=$url" >> "$GITHUB_OUTPUT"
+
+    - name: Summary
+      shell: bash
+      env:
+        UPDATED: ${{ steps.resolve.outputs.updated }}
+        FROM: ${{ steps.resolve.outputs.from_version }}
+        TARGET: ${{ steps.resolve.outputs.to_version }}
+        BRANCH: ${{ steps.resolve.outputs.branch }}
+        PR_URL: ${{ steps.pr.outputs.pr_url }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        {
+          echo "### WordPress core update"
+          echo ""
+          if [ "$UPDATED" != "true" ]; then
+            echo "Already up to date at \`${TARGET}\` - no branch or PR created."
+          else
+            echo "| | |"
+            echo "|---|---|"
+            echo "| From | \`${FROM}\` |"
+            echo "| To | \`${TARGET}\` |"
+            echo "| Branch | \`${BRANCH}\` |"
+            if [ -n "$PR_URL" ]; then
+              echo "| Pull request | ${PR_URL} |"
+            elif [ -n "$DRY_RUN" ]; then
+              echo "| Pull request | _skipped (dry run)_ |"
+            fi
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
