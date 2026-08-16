@@ -15,7 +15,7 @@ every example below uses.
 ## Actions in this repo
 
 - [`setup-runner`](#setup-runner) — installs SSH, Node, PHP/Composer,
-  Pantheon Terminus, Drush, Acquia CLI, OpenVPN, Pandoc as needed.
+  Pantheon Terminus, Drush, Acquia CLI, WP-CLI, OpenVPN, Pandoc as needed.
 - [`site-build`](#site-build) — builds a deployable artifact: Composer
   (no-dev), an optional Laravel Mix theme build, and optional git-based
   artifact-repo prep.
@@ -32,13 +32,13 @@ PHP/Composer and Node always install — their version inputs have non-empty
 defaults (`php_version: '8.3'`, `node_version: '20.x'`), so their steps run
 on every consumer. Pass an empty string (`php_version: ''`) to skip one.
 
-Every other tool — Terminus, Drush, Acquia CLI, OpenVPN, Pandoc — only runs
-if its relevant input is provided.
+Every other tool — Terminus, Drush, Acquia CLI, WP-CLI, OpenVPN, Pandoc —
+only runs if its relevant input is provided.
 
 The on/off flags (`configure_git_identity`, `install_drush`,
-`install_openvpn`, `install_pandoc`) take `'true'` to enable. Omitting them,
-or passing `'false'`, `'0'`, `'no'`, or `'off'`, disables them — so
-`install_drush: 'false'` does what it looks like it does.
+`install_wp_cli`, `install_openvpn`, `install_pandoc`) take `'true'` to
+enable. Omitting them, or passing `'false'`, `'0'`, `'no'`, or `'off'`,
+disables them — so `install_drush: 'false'` does what it looks like it does.
 
 ### Basic PHP/Composer setup (no deployment)
 
@@ -173,6 +173,23 @@ setup:
 
 If you also push to Acquia over git, add **both** `ssh_key` and the Acquia
 `ssh_config` from the section above — neither works without the other.
+
+### WP-CLI (WordPress)
+
+Installed from the pinned release phar, landing at `/usr/local/bin/wp`:
+
+```yaml
+- uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+  with:
+    php_version: '8.3'
+    install_wp_cli: 'true'
+    wp_cli_version: '2.12.0'   # optional; this is the default
+```
+
+`wp_cli_version` is a plain release number with no `v` prefix — the action
+adds it when building the download URL. Pinning means a given tag of this
+action always installs the same WP-CLI, so bump the default here when you
+want the newer one; it won't drift on its own.
 
 ---
 

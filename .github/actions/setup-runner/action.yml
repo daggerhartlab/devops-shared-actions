@@ -1,5 +1,5 @@
 name: "Setup Runner"
-description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Drush, Acquia CLI, OpenVPN, and Pandoc as needed, as a composite action"
+description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Drush, Acquia CLI, WP-CLI, OpenVPN, and Pandoc as needed, as a composite action"
 
 # When this action is used in a workflow, the workflow can pass in values for these inputs.
 #
@@ -88,6 +88,16 @@ inputs:
     description: 'Acquia CLI secret'
     required: false
     default: ''
+
+  # WordPress
+  install_wp_cli:
+    description: "Whether to install WP-CLI. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+  wp_cli_version:
+    description: 'WP-CLI version - https://github.com/wp-cli/wp-cli/releases'
+    required: false
+    default: '2.12.0'
 
   # OpenVPN
   install_openvpn:
@@ -207,6 +217,23 @@ runs:
         cd /tmp && curl -OL "https://github.com/acquia/cli/releases/download/$ACLI_VERSION/acli.phar" && chmod +x acli.phar && mv acli.phar /usr/local/bin/acli
         acli auth:login --key="$ACLI_KEY" --secret="$ACLI_SECRET"
 
+    # WP-CLI
+    # Installed from the pinned release phar rather than the always-latest
+    # stable build, so a given tag of this action always installs the same
+    # WP-CLI. Note the release tag carries a "v" prefix but the phar filename
+    # does not.
+    - name: Install WP-CLI
+      id: wp-cli
+      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_wp_cli) }}
+      shell: bash
+      env:
+        WP_CLI_VERSION: ${{ inputs.wp_cli_version }}
+      run: |
+        cd /tmp
+        curl -OL "https://github.com/wp-cli/wp-cli/releases/download/v$WP_CLI_VERSION/wp-cli-$WP_CLI_VERSION.phar"
+        chmod +x "wp-cli-$WP_CLI_VERSION.phar"
+        mv "wp-cli-$WP_CLI_VERSION.phar" /usr/local/bin/wp
+
     # OpenVPN
     - name: Install OpenVPN
       id: openvpn
@@ -238,6 +265,12 @@ runs:
           terminus --version
         else
           echo "terminus not installed (no pantheon_machine_token provided)"
+        fi
+        if command -v wp >/dev/null 2>&1; then
+          which wp
+          wp --version --allow-root
+        else
+          echo "wp-cli not installed (install_wp_cli not enabled)"
         fi
         which node
         node --version
