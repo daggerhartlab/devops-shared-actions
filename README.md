@@ -15,7 +15,7 @@ every example below uses.
 ## Actions in this repo
 
 - [`setup-runner`](#setup-runner) — installs SSH, Node, PHP/Composer,
-  Pantheon Terminus, Drush, Acquia CLI, OpenVPN, Pandoc as needed.
+  Pantheon Terminus, Acquia CLI, WP-CLI, OpenVPN, Pandoc as needed.
 - [`site-build`](#site-build) — builds a deployable artifact: Composer
   (no-dev), an optional Laravel Mix theme build, and optional git-based
   artifact-repo prep.
@@ -32,13 +32,28 @@ PHP/Composer and Node always install — their version inputs have non-empty
 defaults (`php_version: '8.3'`, `node_version: '20.x'`), so their steps run
 on every consumer. Pass an empty string (`php_version: ''`) to skip one.
 
-Every other tool — Terminus, Drush, Acquia CLI, OpenVPN, Pandoc — only runs
+Every other tool — Terminus, Acquia CLI, WP-CLI, OpenVPN, Pandoc — only runs
 if its relevant input is provided.
 
-The on/off flags (`configure_git_identity`, `install_drush`,
+The on/off flags (`configure_git_identity`, `install_wp_cli`,
 `install_openvpn`, `install_pandoc`) take `'true'` to enable. Omitting them,
 or passing `'false'`, `'0'`, `'no'`, or `'off'`, disables them — so
-`install_drush: 'false'` does what it looks like it does.
+`install_wp_cli: 'false'` does what it looks like it does.
+
+### No Drush
+
+`setup-runner` deliberately does not install Drush. Modern Drupal sites get
+Drush from their own `composer.json`, so `site-build`'s `composer install`
+already puts it at `vendor/bin/drush` — call it from there.
+
+The `install_drush`/`drush_version` inputs were removed because they could
+not do their job: Composer's advisory-blocking policy rejects every Drush 8,
+9, and 10 release (their pinned `symfony/yaml` and `symfony/process`
+constraints all resolve to versions with published advisories), and those are
+exactly the versions a legacy site would want. Only Drush 11+ installs
+cleanly — and any site new enough for Drush 11 already has its own. For a
+Drupal 7 site that genuinely needs Drush 8, use the Drush 8 phar or a
+project-local Composer install rather than a global `composer require`.
 
 ### Basic PHP/Composer setup (no deployment)
 
@@ -174,6 +189,23 @@ setup:
 If you also push to Acquia over git, add **both** `ssh_key` and the Acquia
 `ssh_config` from the section above — neither works without the other.
 
+### WP-CLI (WordPress)
+
+Installed from the pinned release phar, landing at `/usr/local/bin/wp`:
+
+```yaml
+- uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+  with:
+    php_version: '8.3'
+    install_wp_cli: 'true'
+    wp_cli_version: '2.12.0'   # optional; this is the default
+```
+
+`wp_cli_version` is a plain release number with no `v` prefix — the action
+adds it when building the download URL. Pinning means a given tag of this
+action always installs the same WP-CLI, so bump the default here when you
+want the newer one; it won't drift on its own.
+
 ---
 
 ## `site-build`
@@ -259,3 +291,35 @@ don't cost it again.
   `.github/actions/setup-runner/action.yml` for the full reasoning. This is
   handled automatically; no action needed from consumers, but worth knowing
   if you're debugging a future Composer/advisory error in this step.
+
+---
+
+## Testing
+
+`.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
+weekly schedule, and manual dispatch. It exercises the actions from the
+current ref (`./.github/actions/...`), so a PR is tested as it will behave
+once `v1` is moved onto it.
+
+| Job | What it covers |
+|---|---|
+| `lint` | actionlint over the workflows, plus a check that every on/off flag uses the same condition |
+| `flag-semantics` | `install_wp_cli` across 9 values — `true`/`yes`/`1` install, `unset`/`false`/`FALSE`/`0`/`no`/`off` don't |
+| `all-tools` | Everything enabled at once; asserts each binary landed, git identity was set, and `wp_cli_version` was honored |
+| `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
+
+Two things worth knowing if you extend this:
+
+- **`flag-semantics` uses WP-CLI deliberately.** It's fast to install and is
+  *not* preinstalled on the runner image, so asserting "absent" is a real
+  test. Doing the same with `pandoc` or `openvpn` risks a vacuous pass if the
+  runner image already ships them. The `lint` job's condition check is what
+  covers the other flags.
+- **The weekly schedule isn't busywork.** These actions download pinned
+  external artifacts (WP-CLI phar, Pandoc `.deb`, Acquia CLI release) whose
+  URLs can rot with no change here. The scheduled run finds a dead download
+  before a consumer's deploy does. Note GitHub only runs schedules on the
+  default branch and disables them after 60 days of repo inactivity.
+
+Credentialed paths (SSH, Terminus, Acquia CLI) are intentionally untested —
+they need live secrets and can't run on PRs from forks.

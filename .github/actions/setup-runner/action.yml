@@ -1,9 +1,9 @@
 name: "Setup Runner"
-description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Drush, Acquia CLI, OpenVPN, and Pandoc as needed, as a composite action"
+description: "Sets up SSH, Node, PHP/Composer (with caching), Pantheon Terminus, Acquia CLI, WP-CLI, OpenVPN, and Pandoc as needed, as a composite action"
 
 # When this action is used in a workflow, the workflow can pass in values for these inputs.
 #
-# On/off flags below (configure_git_identity, install_drush, install_openvpn,
+# On/off flags below (configure_git_identity, install_wp_cli, install_openvpn,
 # install_pandoc) accept 'true' to enable. Unset, '', 'false', '0', 'no' and
 # 'off' all disable - composite action inputs are always strings, so a bare
 # `!= ''` test would treat the string 'false' as enabled. Comparisons in GitHub
@@ -67,15 +67,7 @@ inputs:
     required: false
     default: '^3.0'
 
-  # Drupal
-  install_drush:
-    description: "Whether to install Drush. This is likely only necessary for old versions of Drupal. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
-    required: false
-    default: ''
-  drush_version:
-    description: 'Drush version'
-    required: false
-    default: '^9'
+  # Acquia
   acli_version:
     description: 'Acquia CLI version - https://github.com/acquia/cli'
     required: false
@@ -88,6 +80,16 @@ inputs:
     description: 'Acquia CLI secret'
     required: false
     default: ''
+
+  # WordPress
+  install_wp_cli:
+    description: "Whether to install WP-CLI. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+  wp_cli_version:
+    description: 'WP-CLI version - https://github.com/wp-cli/wp-cli/releases'
+    required: false
+    default: '2.12.0'
 
   # OpenVPN
   install_openvpn:
@@ -183,17 +185,6 @@ runs:
         composer config -g policy.advisories.block true
         terminus | grep build
 
-    # Drush
-    - name: Install Drush globally
-      id: drush
-      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_drush) }}
-      shell: bash
-      env:
-        DRUSH_VERSION: ${{ inputs.drush_version }}
-      run: |
-        composer global require "drush/drush:$DRUSH_VERSION"
-        ln -s ~/.composer/vendor/bin/drush /usr/local/bin
-
     # Acquia CLI
     - name: Install Acquia CLI
       id: acli
@@ -206,6 +197,23 @@ runs:
       run: |
         cd /tmp && curl -OL "https://github.com/acquia/cli/releases/download/$ACLI_VERSION/acli.phar" && chmod +x acli.phar && mv acli.phar /usr/local/bin/acli
         acli auth:login --key="$ACLI_KEY" --secret="$ACLI_SECRET"
+
+    # WP-CLI
+    # Installed from the pinned release phar rather than the always-latest
+    # stable build, so a given tag of this action always installs the same
+    # WP-CLI. Note the release tag carries a "v" prefix but the phar filename
+    # does not.
+    - name: Install WP-CLI
+      id: wp-cli
+      if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_wp_cli) }}
+      shell: bash
+      env:
+        WP_CLI_VERSION: ${{ inputs.wp_cli_version }}
+      run: |
+        cd /tmp
+        curl -OL "https://github.com/wp-cli/wp-cli/releases/download/v$WP_CLI_VERSION/wp-cli-$WP_CLI_VERSION.phar"
+        chmod +x "wp-cli-$WP_CLI_VERSION.phar"
+        mv "wp-cli-$WP_CLI_VERSION.phar" /usr/local/bin/wp
 
     # OpenVPN
     - name: Install OpenVPN
@@ -225,21 +233,30 @@ runs:
         wget https://github.com/jgm/pandoc/releases/download/2.18/pandoc-2.18-1-amd64.deb
         sudo dpkg -i pandoc-2.18-1-amd64.deb  # install an official pandoc release (update version as appropriate)
 
-    # Callout versions of things we installed
+    # Callout versions of things we installed.
+    #
+    # Every tool is guarded: this step is diagnostic output, so a tool that was
+    # never requested must not fail the job. Without the guards, passing
+    # php_version: '' or node_version: '' to skip a setup step would break here
+    # instead. Version flags that exit non-zero (openvpn) are tolerated too.
     - name: Versions
       shell: bash
       run: |
-        which composer
-        composer --version
-        which php
-        php --version
-        if command -v terminus >/dev/null 2>&1; then
-          which terminus
-          terminus --version
-        else
-          echo "terminus not installed (no pantheon_machine_token provided)"
-        fi
-        which node
-        node --version
-        which npm
-        npm --version
+        show() {
+          cmd="$1"; shift
+          if command -v "$cmd" >/dev/null 2>&1; then
+            printf '%-9s %s\n' "$cmd" "$(command -v "$cmd")"
+            "$cmd" "$@" 2>&1 | head -1 || true
+          else
+            printf '%-9s not installed\n' "$cmd"
+          fi
+        }
+        show composer --version
+        show php --version
+        show node --version
+        show npm --version
+        show terminus --version
+        show wp --version --allow-root
+        show acli --version
+        show pandoc --version
+        show openvpn --version
