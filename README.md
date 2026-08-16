@@ -276,3 +276,35 @@ don't cost it again.
   `.github/actions/setup-runner/action.yml` for the full reasoning. This is
   handled automatically; no action needed from consumers, but worth knowing
   if you're debugging a future Composer/advisory error in this step.
+
+---
+
+## Testing
+
+`.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
+weekly schedule, and manual dispatch. It exercises the actions from the
+current ref (`./.github/actions/...`), so a PR is tested as it will behave
+once `v1` is moved onto it.
+
+| Job | What it covers |
+|---|---|
+| `lint` | actionlint over the workflows, plus a check that every on/off flag uses the same condition |
+| `flag-semantics` | `install_wp_cli` across 9 values — `true`/`yes`/`1` install, `unset`/`false`/`FALSE`/`0`/`no`/`off` don't |
+| `all-tools` | Everything enabled at once; asserts each binary landed, git identity was set, and `wp_cli_version` was honored |
+| `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
+
+Two things worth knowing if you extend this:
+
+- **`flag-semantics` uses WP-CLI deliberately.** It's fast to install and is
+  *not* preinstalled on the runner image, so asserting "absent" is a real
+  test. Doing the same with `pandoc` or `openvpn` risks a vacuous pass if the
+  runner image already ships them. The `lint` job's condition check is what
+  covers the other flags.
+- **The weekly schedule isn't busywork.** These actions download pinned
+  external artifacts (WP-CLI phar, Pandoc `.deb`, Acquia CLI release) whose
+  URLs can rot with no change here. The scheduled run finds a dead download
+  before a consumer's deploy does. Note GitHub only runs schedules on the
+  default branch and disables them after 60 days of repo inactivity.
+
+Credentialed paths (SSH, Terminus, Acquia CLI) are intentionally untested —
+they need live secrets and can't run on PRs from forks.

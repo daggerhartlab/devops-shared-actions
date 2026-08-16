@@ -1,0 +1,172 @@
+name: Test actions
+
+# These tests exercise the actions from the current ref (via ./.github/actions/...),
+# not from @v1 - so a PR is tested as it would behave once v1 is moved onto it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The actions download pinned external artifacts (WP-CLI phar, Pandoc .deb,
+  # Acquia CLI release). Those URLs can rot without any change here, so run
+  # weekly to catch a dead download before a consumer's deploy does.
+  # Note: scheduled runs only happen on the default branch, and GitHub disables
+  # them after 60 days of repo inactivity.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # actionlint checks workflow files. It also reads the metadata of local
+      # ./-referenced actions, so a `with:` key here that setup-runner does not
+      # declare becomes a hard failure instead of being silently ignored.
+      - name: Run actionlint
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          cd /tmp
+          curl -sOL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
+          tar xzf "${archive}" actionlint
+          cd "$GITHUB_WORKSPACE"
+          /tmp/actionlint -color
+
+      # The flag-semantics job below exercises one representative flag. This
+      # guards against a different flag drifting to a condition that job would
+      # never notice.
+      - name: All boolean flags share one condition
+        run: |
+          ruby -ryaml -e '
+            d = YAML.load_file(".github/actions/setup-runner/action.yml")
+            flags = d["inputs"].keys.select { |k| k.start_with?("install_") || k == "configure_git_identity" }
+            steps = d["runs"]["steps"]
+            bad = flags.reject { |f|
+              steps.any? { |s| s["if"].to_s.include?("fromJSON") && s["if"].to_s.include?("inputs.#{f}") }
+            }
+            abort "flags not using the shared falsey-list condition: #{bad.inspect}" unless bad.empty?
+            puts "ok: #{flags.size} flags share the condition (#{flags.join(", ")})"
+          '
+
+  flag-semantics:
+    name: "install_wp_cli=${{ matrix.label }} -> ${{ matrix.expect }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Any non-falsey value enables - deliberate, for backward
+          # compatibility with consumers already passing 'yes' or '1'.
+          - { value: 'true',  expect: present, label: "true" }
+          - { value: 'yes',   expect: present, label: "yes" }
+          - { value: '1',     expect: present, label: "1" }
+          # These are the regression cases: before the fix, every one of these
+          # ENABLED the step because the condition was a bare `!= ''`.
+          - { value: '',      expect: absent,  label: "unset" }
+          - { value: 'false', expect: absent,  label: "false" }
+          - { value: 'FALSE', expect: absent,  label: "FALSE" }
+          - { value: '0',     expect: absent,  label: "0" }
+          - { value: 'no',    expect: absent,  label: "no" }
+          - { value: 'off',   expect: absent,  label: "off" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          install_wp_cli: ${{ matrix.value }}
+
+      # wp-cli is the representative flag because it is fast to install and is
+      # NOT preinstalled on the runner image - so "absent" is a real assertion
+      # rather than one that passes by accident.
+      - name: Assert wp presence matches expectation
+        env:
+          EXPECT: ${{ matrix.expect }}
+          VALUE: ${{ matrix.value }}
+        run: |
+          if command -v wp >/dev/null 2>&1; then actual=present; else actual=absent; fi
+          echo "install_wp_cli='${VALUE}'  expected=${EXPECT}  actual=${actual}"
+          if [ "$actual" != "$EXPECT" ]; then
+            echo "::error::install_wp_cli='${VALUE}' expected ${EXPECT}, got ${actual}"
+            exit 1
+          fi
+
+  all-tools:
+    name: All tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          configure_git_identity: 'true'
+          php_version: '8.3'
+          php_extensions: gd, curl, bcmath
+          install_drush: 'true'
+          install_wp_cli: 'true'
+          wp_cli_version: '2.12.0'
+          install_pandoc: 'true'
+          install_openvpn: 'true'
+
+      - name: Assert every tool is present
+        run: |
+          fail=0
+          for cmd in php composer node npm drush wp pandoc openvpn; do
+            if command -v "$cmd" >/dev/null 2>&1; then
+              printf 'ok       %-10s %s\n' "$cmd" "$(command -v "$cmd")"
+            else
+              echo "::error::missing: $cmd"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: Assert configure_git_identity took effect
+        run: |
+          name=$(git config user.name || true)
+          email=$(git config user.email || true)
+          echo "git identity: '${name}' <${email}>"
+          if [ -z "$name" ] || [ -z "$email" ]; then
+            echo "::error::configure_git_identity was set but git user.name/user.email is empty"
+            exit 1
+          fi
+
+      # Proves an input is actually plumbed through, not just that some binary
+      # with the right name landed on PATH.
+      - name: Assert wp_cli_version was honored
+        run: |
+          installed=$(wp --version --allow-root 2>/dev/null | head -1)
+          echo "reported: ${installed}"
+          case "$installed" in
+            *2.12.0*) echo "ok: matches the requested wp_cli_version" ;;
+            *) echo "::error::expected WP-CLI 2.12.0, got: ${installed}"; exit 1 ;;
+          esac
+
+  minimal:
+    name: Empty version inputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The README tells consumers they can skip PHP or Node by passing ''.
+      # This asserts that actually works - every step should skip cleanly and
+      # the action should still finish successfully.
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: ''
+          node_version: ''
+
+      - name: Reached the end without failing
+        run: echo "setup-runner completed with all version inputs empty"

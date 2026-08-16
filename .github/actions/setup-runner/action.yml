@@ -252,27 +252,31 @@ runs:
         wget https://github.com/jgm/pandoc/releases/download/2.18/pandoc-2.18-1-amd64.deb
         sudo dpkg -i pandoc-2.18-1-amd64.deb  # install an official pandoc release (update version as appropriate)
 
-    # Callout versions of things we installed
+    # Callout versions of things we installed.
+    #
+    # Every tool is guarded: this step is diagnostic output, so a tool that was
+    # never requested must not fail the job. Without the guards, passing
+    # php_version: '' or node_version: '' to skip a setup step would break here
+    # instead. Version flags that exit non-zero (openvpn) are tolerated too.
     - name: Versions
       shell: bash
       run: |
-        which composer
-        composer --version
-        which php
-        php --version
-        if command -v terminus >/dev/null 2>&1; then
-          which terminus
-          terminus --version
-        else
-          echo "terminus not installed (no pantheon_machine_token provided)"
-        fi
-        if command -v wp >/dev/null 2>&1; then
-          which wp
-          wp --version --allow-root
-        else
-          echo "wp-cli not installed (install_wp_cli not enabled)"
-        fi
-        which node
-        node --version
-        which npm
-        npm --version
+        show() {
+          cmd="$1"; shift
+          if command -v "$cmd" >/dev/null 2>&1; then
+            printf '%-9s %s\n' "$cmd" "$(command -v "$cmd")"
+            "$cmd" "$@" 2>&1 | head -1 || true
+          else
+            printf '%-9s not installed\n' "$cmd"
+          fi
+        }
+        show composer --version
+        show php --version
+        show node --version
+        show npm --version
+        show terminus --version
+        show drush --version
+        show wp --version --allow-root
+        show acli --version
+        show pandoc --version
+        show openvpn --version
