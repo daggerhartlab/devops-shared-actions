@@ -221,8 +221,28 @@ runs:
       if: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.install_openvpn) }}
       shell: bash
       run: |
-        sudo apt update
-        sudo apt install -y openvpn openvpn-systemd-resolved
+        # apt-get, not apt: apt has no stable CLI for scripts (it says so
+        # itself) and every other apt call in our repos already uses apt-get.
+        #
+        # The rest of this exists to bound a hang instead of waiting on one.
+        # Composite action steps cannot set timeout-minutes, so the ceiling has
+        # to come from `timeout` here - otherwise a stalled apt keeps running
+        # until GitHub kills the job at its 6-hour limit.
+        #   DPkg::Lock::Timeout  fail after 2 min if another apt process (e.g.
+        #                        unattended-upgrades) holds the dpkg lock,
+        #                        instead of blocking indefinitely
+        #   Acquire::Retries     retry a flaky mirror rather than stalling
+        #   DEBIAN_FRONTEND      never block waiting on a debconf prompt
+        if ! sudo DEBIAN_FRONTEND=noninteractive timeout 300 \
+             apt-get update -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120; then
+          echo "::error::apt-get update failed or timed out after 5 minutes."
+          exit 1
+        fi
+        if ! sudo DEBIAN_FRONTEND=noninteractive timeout 600 \
+             apt-get install -y -o DPkg::Lock::Timeout=120 openvpn openvpn-systemd-resolved; then
+          echo "::error::apt-get install failed or timed out after 10 minutes."
+          exit 1
+        fi
 
     # Pandoc
     - name: Pandoc
