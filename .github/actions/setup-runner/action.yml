@@ -239,6 +239,21 @@ runs:
         # failover already exists - but apt's default 120s per-request timeout
         # means a dead azure mirror burns minutes before falling through. Cap it
         # low and retry once, so failover is cheap instead of expensive.
+        # GitHub's mirrorlist puts azure.archive.ubuntu.com at priority 1 and
+        # archive.ubuntu.com at 2. When the Azure CDN is degraded apt burns the
+        # whole step budget Ign-ing it before falling through, so drop it and go
+        # straight to the canonical archive. Guarded: no-op if the file is gone
+        # (image change) or if azure is somehow the only entry.
+        mirrors=/etc/apt/apt-mirrors.txt
+        if [ -f "$mirrors" ]; then
+          keep=$(grep -cv 'azure\.archive\.ubuntu\.com' "$mirrors" 2>/dev/null) || keep=0
+          if [ "$keep" -gt 0 ]; then
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
+          fi
+          echo "apt mirrors in use:"
+          sed 's/^/  /' "$mirrors"
+        fi
+
         if ! sudo env DEBIAN_FRONTEND=noninteractive timeout 300 \
              apt-get update \
                -o Acquire::Retries=1 \
