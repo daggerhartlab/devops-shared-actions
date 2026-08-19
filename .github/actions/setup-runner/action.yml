@@ -234,13 +234,27 @@ runs:
         #   Acquire::Retries     retry a flaky mirror rather than stalling
         #   DEBIAN_FRONTEND      never block waiting on a debconf prompt
         # Set via `sudo env` because sudoers env_reset can refuse `sudo VAR=val`.
+        # http::Timeout is the lever that matters. GitHub's mirrorlist puts
+        # azure.archive.ubuntu.com at priority 1 and archive.ubuntu.com at 2, so
+        # failover already exists - but apt's default 120s per-request timeout
+        # means a dead azure mirror burns minutes before falling through. Cap it
+        # low and retry once, so failover is cheap instead of expensive.
         if ! sudo env DEBIAN_FRONTEND=noninteractive timeout 300 \
-             apt-get update -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120; then
+             apt-get update \
+               -o Acquire::Retries=1 \
+               -o Acquire::http::Timeout=15 \
+               -o Acquire::https::Timeout=15 \
+               -o DPkg::Lock::Timeout=120; then
           echo "::error::apt-get update failed or timed out after 5 minutes."
           exit 1
         fi
         if ! sudo env DEBIAN_FRONTEND=noninteractive timeout 600 \
-             apt-get install -y -o DPkg::Lock::Timeout=120 openvpn openvpn-systemd-resolved; then
+             apt-get install -y \
+               -o Acquire::Retries=1 \
+               -o Acquire::http::Timeout=15 \
+               -o Acquire::https::Timeout=15 \
+               -o DPkg::Lock::Timeout=120 \
+               openvpn openvpn-systemd-resolved; then
           echo "::error::apt-get install failed or timed out after 10 minutes."
           exit 1
         fi
