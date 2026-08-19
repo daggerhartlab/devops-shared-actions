@@ -233,12 +233,13 @@ runs:
         #                        instead of blocking indefinitely
         #   Acquire::Retries     retry a flaky mirror rather than stalling
         #   DEBIAN_FRONTEND      never block waiting on a debconf prompt
-        if ! sudo DEBIAN_FRONTEND=noninteractive timeout 300 \
+        # Set via `sudo env` because sudoers env_reset can refuse `sudo VAR=val`.
+        if ! sudo env DEBIAN_FRONTEND=noninteractive timeout 300 \
              apt-get update -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120; then
           echo "::error::apt-get update failed or timed out after 5 minutes."
           exit 1
         fi
-        if ! sudo DEBIAN_FRONTEND=noninteractive timeout 600 \
+        if ! sudo env DEBIAN_FRONTEND=noninteractive timeout 600 \
              apt-get install -y -o DPkg::Lock::Timeout=120 openvpn openvpn-systemd-resolved; then
           echo "::error::apt-get install failed or timed out after 10 minutes."
           exit 1
