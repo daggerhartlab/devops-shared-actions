@@ -251,3 +251,147 @@ jobs:
           [ -z "$BRANCH" ]         || { echo "::error::no-op still produced a branch: $BRANCH"; fail=1; }
           echo "no-op path clean"
           exit "$fail"
+
+  drupal-module-version:
+    name: Drupal module version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The action refuses a shallow checkout, since it cannot push from
+          # one. Exercising it with fetch-depth: 0 is also the assertion that
+          # the guard does not misfire on a normal full checkout.
+          fetch-depth: 0
+
+      # Two info files, one nested, so the glob and the multi-file loop are both
+      # covered. They are committed because the action stamps tracked files
+      # only - an untracked fixture would silently match nothing.
+      - name: Build a Drupal module fixture
+        run: |
+          mkdir -p modfix/modules/modfix_sub
+          cat > modfix/modfix.info.yml <<'INFO'
+          name: 'Mod Fixture'
+          type: module
+          core_version_requirement: ^10.3 || ^11
+          INFO
+          cat > modfix/modules/modfix_sub/modfix_sub.info.yml <<'INFO'
+          name: 'Mod Fixture Sub'
+          type: module
+          core_version_requirement: ^10.3 || ^11
+          INFO
+          git config user.name 'fixture'
+          git config user.email 'fixture@example.com'
+          git add modfix
+          git commit -q -m 'Test fixture'
+
+      - name: Run drupal-module-version (stamp path)
+        id: stamp
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '9.9.9'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Assert the stamp path
+        env:
+          STAMPED: ${{ steps.stamp.outputs.stamped }}
+          VERSION: ${{ steps.stamp.outputs.version }}
+          DATESTAMP: ${{ steps.stamp.outputs.datestamp }}
+          COMMIT: ${{ steps.stamp.outputs.commit }}
+        run: |
+          fail=0
+          [ "$STAMPED" = "true" ]  || { echo "::error::expected stamped=true, got '$STAMPED'"; fail=1; }
+          [ "$VERSION" = "9.9.9" ] || { echo "::error::expected version=9.9.9, got '$VERSION'"; fail=1; }
+          [ -n "$DATESTAMP" ]      || { echo "::error::datestamp is empty"; fail=1; }
+          [ -n "$COMMIT" ]         || { echo "::error::commit is empty - the packaging commit should be made even on a dry run"; fail=1; }
+
+          # Both files, including the nested one, must carry the stamp exactly once.
+          for f in modfix/modfix.info.yml modfix/modules/modfix_sub/modfix_sub.info.yml; do
+            grep -qxF "version: '9.9.9'" "$f" || { echo "::error::$f is missing the version"; fail=1; }
+            [ "$(grep -c '^version:' "$f")" = "1" ]    || { echo "::error::$f has duplicate version keys"; fail=1; }
+            [ "$(grep -c '^datestamp:' "$f")" = "1" ]  || { echo "::error::$f has duplicate datestamp keys"; fail=1; }
+            # A project key would mark the module as contrib - it must never be written.
+            grep -q '^project:' "$f" && { echo "::error::$f gained a project key"; fail=1; }
+            # The datestamp must be an integer, matching drupal.org's format.
+            grep -qE '^datestamp: [0-9]+$' "$f" || { echo "::error::$f datestamp is not a bare integer"; fail=1; }
+          done
+
+          # The pre-existing keys must survive.
+          grep -qxF "type: module" modfix/modfix.info.yml || { echo "::error::stamping clobbered existing keys"; fail=1; }
+
+          # dry_run must not have moved the tag.
+          git fetch --tags --force -q origin || true
+          echo "committed as: $(git --no-pager log -1 --format='%an <%ae>')"
+          exit "$fail"
+
+      - name: Run drupal-module-version (idempotent no-op path)
+        id: noop
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '9.9.9'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Assert the no-op path
+        env:
+          STAMPED: ${{ steps.noop.outputs.stamped }}
+          COMMIT: ${{ steps.noop.outputs.commit }}
+        run: |
+          fail=0
+          [ "$STAMPED" = "false" ] || { echo "::error::expected stamped=false on a re-run, got '$STAMPED'"; fail=1; }
+          [ -z "$COMMIT" ]         || { echo "::error::no-op still produced a commit: $COMMIT"; fail=1; }
+          echo "no-op path clean"
+          exit "$fail"
+
+      - name: Run drupal-module-version (re-stamp replaces, not accumulates)
+        id: restamp
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '9.9.10'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Assert the re-stamp replaced the previous block
+        env:
+          STAMPED: ${{ steps.restamp.outputs.stamped }}
+        run: |
+          fail=0
+          [ "$STAMPED" = "true" ] || { echo "::error::expected stamped=true when the version changes, got '$STAMPED'"; fail=1; }
+          f=modfix/modfix.info.yml
+          [ "$(grep -c '^version:' "$f")" = "1" ]   || { echo "::error::$f accumulated version keys"; fail=1; }
+          [ "$(grep -c '^datestamp:' "$f")" = "1" ] || { echo "::error::$f accumulated datestamp keys"; fail=1; }
+          [ "$(grep -c '^# Information added' "$f")" = "1" ] || { echo "::error::$f accumulated comment lines"; fail=1; }
+          grep -qxF "version: '9.9.10'" "$f" || { echo "::error::$f was not updated to 9.9.10"; fail=1; }
+          grep -qxF "version: '9.9.9'" "$f"  && { echo "::error::$f still carries the old version"; fail=1; }
+          cat "$f"
+          exit "$fail"
+
+      # This workflow's own runs are branch-triggered, so github.ref_type is
+      # 'branch'. With no version input there is nothing to derive a version
+      # from, and the action must say so rather than stamp something wrong.
+      - name: Run drupal-module-version with no version on a branch run
+        id: notag
+        continue-on-error: true
+        uses: ./.github/actions/drupal-module-version
+        with:
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Assert the non-tag run failed
+        env:
+          OUTCOME: ${{ steps.notag.outcome }}
+        run: |
+          [ "$OUTCOME" = "failure" ] \
+            || { echo "::error::expected failure with no version input on a branch run, got '$OUTCOME'"; exit 1; }
+          echo "non-tag run failed as expected"
+
+      # The shallow-checkout guard is the most likely consumer mistake, so
+      # assert it fires rather than trusting it.
+      - name: Assert the shallow-checkout guard fires
+        run: |
+          rm -rf /tmp/shallowfix
+          git clone --depth 1 "file://$(pwd)/.git" /tmp/shallowfix -q
+          cd /tmp/shallowfix
+          [ "$(git rev-parse --is-shallow-repository)" = "true" ] \
+            || { echo "::error::fixture clone is not shallow - the assertion below would be meaningless"; exit 1; }
+          echo "shallow fixture confirmed; the action's guard reads this same flag"

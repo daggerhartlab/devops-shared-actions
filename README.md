@@ -21,8 +21,11 @@ every example below uses.
   artifact-repo prep.
 - [`wp-core-update`](#wp-core-update) — updates WordPress core files,
   verifies them against WordPress.org checksums, and opens a PR.
+- [`drupal-module-version`](#drupal-module-version) — stamps a release
+  version and datestamp into a custom Drupal module's `*.info.yml` and moves
+  the tag onto the packaging commit.
 
-Both are composite actions; see each `action.yml` for the full,
+All are composite actions; see each `action.yml` for the full,
 authoritative list of inputs and defaults. This README covers common usage
 patterns and the gotchas we've already hit.
 
@@ -374,6 +377,79 @@ Outputs: `updated`, `from_version`, `to_version`, `branch`, `pr_url`.
 
 ---
 
+## `drupal-module-version`
+
+Gives a custom Drupal module a version number. Drupal reads an extension's
+version from its `*.info.yml`, and drupal.org's packaging script writes that
+key at release time — which is why a contrib module downloaded from
+drupal.org reports a version and the same module cloned from git does not. A
+custom module that Composer installs from a git repository is in the second
+category, so Drupal shows no version and anything reporting on the site sees
+`null`.
+
+This action does the same job on a tag push: write the version and datestamp
+into every info file, commit, and move the tag onto that commit. The default
+branch stays unversioned.
+
+```yaml
+name: Stamp Release Version
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: write
+
+jobs:
+  stamp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Required — the action pushes, and a shallow clone cannot be
+          # pushed from. The action fails fast if you forget.
+          fetch-depth: 0
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/drupal-module-version@v1
+```
+
+That is the whole consumer. Drop it into any custom module repository
+unchanged: the info files are found by glob, so nothing is hardcoded per
+module.
+
+Outputs: `stamped`, `version`, `datestamp`, `files`, `commit`.
+
+### Gotchas
+
+- **It moves the tag.** The tag ends up on a packaging commit that is not on
+  the default branch. That is deliberate — Composer installs a git-sourced
+  package by cloning the tag, so the version has to be in the tag's tree to
+  reach the installed module. A tarball attached to a GitHub Release would
+  never be fetched. The originally-tagged commit stays reachable through its
+  branch, so no existing `composer.lock` pin is orphaned. Anyone who fetched
+  the tag before the run needs `git fetch --tags --force`.
+- **Tag protection rules will block it.** The push is a force-update of an
+  existing tag.
+- **Only version-shaped tags are stamped.** A tag like `latest` or
+  `deploy-2026` is a clean skip with `stamped=false`, rather than being
+  written in as a version string. A leading `v` is stripped, so `v1.0.0` and
+  `1.0.0` both give `1.0.0`.
+- **It never writes `project`.** drupal.org's script adds one, but a
+  `project` key marks an extension as contrib, so fleet tooling resolves it
+  against drupal.org — for a private module that is a lookup which can only
+  fail. There is deliberately no input to enable it.
+- **Re-running is safe.** If the version is already stamped the action is a
+  no-op, and stamping a *different* version replaces the previous block
+  rather than appending a second one. A push made with `GITHUB_TOKEN` does
+  not re-trigger workflows, so a tag-push trigger cannot loop; the
+  idempotency guard is what keeps that true if you pass a PAT instead.
+- **`module_path` is for repos holding more than one module.** Left unset,
+  every tracked `*.info.yml` in the repo is stamped, which is what a
+  single-module repo wants. Git's pathspec glob crosses directory
+  separators, so submodules nested under the path are included either way.
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -388,6 +464,7 @@ once `v1` is moved onto it.
 | `all-tools` | Everything enabled at once; asserts each binary landed, git identity was set, and `wp_cli_version` was honored |
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
+| `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key, that a re-run is a no-op, that a changed version replaces rather than accumulates, and that a run with no version on a branch fails |
 
 Two things worth knowing if you extend this:
 

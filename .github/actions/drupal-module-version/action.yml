@@ -1,0 +1,290 @@
+name: "Drupal Module Version"
+description: "Stamps a release version and datestamp into a custom Drupal module's *.info.yml files, then moves the tag onto the resulting packaging commit."
+
+# Why this exists:
+# Drupal reads an extension's version from its *.info.yml. drupal.org's
+# packaging script writes that key at release time - which is why the same
+# module reports a version when downloaded from drupal.org and no version when
+# cloned from git. A custom module that Composer installs from a git repository
+# is in the second category: Drupal shows no version, and anything reporting on
+# the site sees null.
+#
+# This closes that gap the same way drupal.org does. On a version tag, write the
+# version and datestamp into every info file, commit, and move the tag onto that
+# commit. The default branch stays unversioned, matching the convention that a
+# version exists only in a packaged release.
+#
+# Why the tag is moved rather than a release asset built:
+# Composer installs a git-sourced package by cloning the tag, so a tarball
+# attached to a GitHub Release is never fetched and stamping one would leave the
+# installed module unversioned. Moving the tag is what puts the version in front
+# of Composer.
+#
+# Why "project" is never written:
+# drupal.org's script also adds `project: <name>`. A project key marks an
+# extension as contrib, so fleet tooling resolves it against drupal.org - which
+# for a private module is a lookup that can only fail. Version and datestamp
+# give the useful half without that side effect. There is deliberately no input
+# to turn this on.
+
+inputs:
+  version:
+    description: 'Version to stamp, e.g. 1.0.0. Leave unset to derive it from the tag that triggered the run, stripping any leading "v". Set it to stamp from a workflow_dispatch, or to exercise the action without tagging.'
+    required: false
+    default: ''
+  module_path:
+    description: 'Restrict stamping to this subtree, relative to the repo root. Leave unset to stamp every tracked *.info.yml, which is what a single-module repository wants.'
+    required: false
+    default: ''
+  token:
+    description: 'Token used to push the moved tag. Leave unset to use the workflow GITHUB_TOKEN - a push made with GITHUB_TOKEN does not re-trigger workflows, which is what stops a tag-push trigger from looping. Pass a PAT only if the moved tag must fire other workflows; the idempotency guard keeps that terminating after one no-op run.'
+    required: false
+    default: ''
+  dry_run:
+    description: "Do everything except push the moved tag. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+
+outputs:
+  stamped:
+    description: "'true' if info files were changed and committed, 'false' when the tag was not version-shaped or the version was already present."
+    value: ${{ steps.stamp.outputs.stamped }}
+  version:
+    description: 'The version written, empty when nothing was stamped.'
+    value: ${{ steps.resolve.outputs.version }}
+  datestamp:
+    description: 'The Unix timestamp written alongside the version, empty when nothing was stamped.'
+    value: ${{ steps.stamp.outputs.datestamp }}
+  files:
+    description: 'Newline-separated list of the info files stamped, empty when nothing was stamped.'
+    value: ${{ steps.stamp.outputs.files }}
+  commit:
+    description: 'SHA of the packaging commit the tag now points at, empty on a dry run or a no-op.'
+    value: ${{ steps.commit.outputs.commit }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check the checkout can be pushed from
+      shell: bash
+      run: |
+        # actions/checkout is shallow by default and a shallow clone cannot be
+        # pushed from. Failing here, naming the fix, beats a cryptic push error
+        # after the commit has already been made.
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::error::Repository was checked out shallow. Add 'fetch-depth: 0' to the actions/checkout step that runs before this action."
+          exit 1
+        fi
+
+    - name: Resolve the version
+      id: resolve
+      shell: bash
+      env:
+        VERSION_INPUT: ${{ inputs.version }}
+        REF_NAME: ${{ github.ref_name }}
+        REF_TYPE: ${{ github.ref_type }}
+      run: |
+        if [ -n "$VERSION_INPUT" ]; then
+          version="$VERSION_INPUT"
+          echo "Using the version input: ${version}"
+        else
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::No version input given and this run was not triggered by a tag (ref_type='${REF_TYPE}'). Pass the version input, or trigger the workflow on a tag push."
+            exit 1
+          fi
+
+          version="${REF_NAME#v}"
+
+          # Only version-shaped tags are stamped, so a tag such as 'latest' or
+          # 'deploy-2026' is never written in as a version string.
+          case "$version" in
+            [0-9]*.[0-9]*) ;;
+            *)
+              echo "Tag '${REF_NAME}' is not version-shaped - nothing to stamp."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          echo "Resolved version '${version}' from tag '${REF_NAME}'."
+        fi
+
+        {
+          echo "version=${version}"
+          echo "tag=${REF_NAME}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Stamp the info files
+      id: stamp
+      if: ${{ steps.resolve.outputs.skip != 'true' }}
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+        MODULE_PATH: ${{ inputs.module_path }}
+      run: |
+        datestamp="$(date -u +%s)"
+        today="$(date -u +%Y-%m-%d)"
+
+        # A read loop rather than mapfile: mapfile is a bash 4 builtin and
+        # GitHub's macOS runners still ship bash 3.2. Note git's pathspec glob
+        # crosses directory separators, so this also catches submodules nested
+        # under module_path.
+        files=()
+        if [ -n "$MODULE_PATH" ]; then
+          pathspec="${MODULE_PATH%/}/*.info.yml"
+        else
+          pathspec='*.info.yml'
+        fi
+        while IFS= read -r file; do
+          [ -n "$file" ] && files+=("$file")
+        done < <(git ls-files -- "$pathspec")
+
+        if [ "${#files[@]}" -eq 0 ]; then
+          if [ -n "$MODULE_PATH" ]; then
+            echo "::error::No tracked *.info.yml under '${MODULE_PATH}'. Check the module_path input."
+          else
+            echo "::error::No tracked *.info.yml in this repository. Is this a Drupal extension repository?"
+          fi
+          exit 1
+        fi
+
+        # Idempotency. A push made with GITHUB_TOKEN does not re-trigger
+        # workflows, so the tag move cannot loop on its own; this guard keeps
+        # that true when a PAT is used instead, where that protection is gone.
+        needs_work=false
+        for file in "${files[@]}"; do
+          grep -qxF "version: '${VERSION}'" "$file" || needs_work=true
+        done
+
+        if [ "$needs_work" = false ]; then
+          echo "Every info file already carries version '${VERSION}' - nothing to do."
+          {
+            echo "stamped=false"
+            echo "datestamp="
+            echo "files="
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        for file in "${files[@]}"; do
+          # Remove any previous stamp first, so a re-run replaces the block
+          # instead of appending a second one.
+          sed -i \
+            -e '/^# Information added by the release workflow on /d' \
+            -e '/^version:/d' \
+            -e '/^datestamp:/d' \
+            "$file"
+
+          # Collapse trailing newlines to exactly one before appending.
+          perl -0pi -e 's/\n+\z/\n/' "$file"
+
+          {
+            echo ""
+            echo "# Information added by the release workflow on ${today}"
+            echo "version: '${VERSION}'"
+            echo "datestamp: ${datestamp}"
+          } >> "$file"
+
+          echo "::group::${file}"
+          cat "$file"
+          echo "::endgroup::"
+        done
+
+        {
+          echo "stamped=true"
+          echo "datestamp=${datestamp}"
+          echo "files<<INFO_FILES"
+          printf '%s\n' "${files[@]}"
+          echo "INFO_FILES"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Commit the packaging change
+      id: commit
+      if: ${{ steps.stamp.outputs.stamped == 'true' }}
+      shell: bash
+      env:
+        ACTOR: ${{ github.actor }}
+        ACTOR_ID: ${{ github.actor_id }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+        MODULE_PATH: ${{ inputs.module_path }}
+      run: |
+        # The <id>+<login>@users.noreply.github.com form links the commit back
+        # to a GitHub profile, so the packaging commit is attributed to whoever
+        # pushed the tag. Do not also pass configure_git_identity to
+        # setup-runner: that sets the identity from the last commit's author and
+        # would win or lose depending on step order.
+        git config user.name "$ACTOR"
+        git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
+
+        if [ -n "$MODULE_PATH" ]; then
+          git add -- "${MODULE_PATH%/}/*.info.yml"
+        else
+          git add -- '*.info.yml'
+        fi
+
+        if git diff --cached --quiet; then
+          echo "::error::Info files were rewritten but staged identically - refusing to commit. This should be impossible; check the stamp step's output above."
+          exit 1
+        fi
+
+        echo "staged: $(git diff --cached --shortstat)"
+        git commit -m "Set version ${VERSION} for release"
+        git --no-pager log -1 --format='committed %h by %an <%ae>'
+
+        echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Move the tag onto the packaging commit
+      if: ${{ steps.stamp.outputs.stamped == 'true' && contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token || github.token }}
+        REPO: ${{ github.repository }}
+        TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        # Set the remote explicitly so the chosen token is what authenticates
+        # the push, rather than whatever credentials actions/checkout persisted.
+        git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+
+        # The commit that was originally tagged stays reachable through its
+        # branch, so an existing composer.lock pinning it is never orphaned.
+        git tag -f "$TAG"
+        git push --force origin "refs/tags/${TAG}"
+
+        echo "Tag '${TAG}' now points at $(git rev-parse HEAD)."
+
+    - name: Summary
+      shell: bash
+      env:
+        STAMPED: ${{ steps.stamp.outputs.stamped }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+        DATESTAMP: ${{ steps.stamp.outputs.datestamp }}
+        FILES: ${{ steps.stamp.outputs.files }}
+        COMMIT: ${{ steps.commit.outputs.commit }}
+        TAG: ${{ steps.resolve.outputs.tag }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        {
+          echo "### Drupal module version"
+          echo ""
+          if [ "$STAMPED" != "true" ]; then
+            if [ -z "$VERSION" ]; then
+              echo "Tag \`${TAG}\` is not version-shaped - nothing stamped."
+            else
+              echo "Version \`${VERSION}\` was already stamped - nothing to do."
+            fi
+          else
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Datestamp | \`${DATESTAMP}\` |"
+            echo "| Tag | \`${TAG}\` |"
+            if [ -n "$DRY_RUN" ] && ! printf '%s' "$DRY_RUN" | grep -qiE '^(false|0|no|off)$'; then
+              echo "| Tag moved | _skipped (dry run)_ |"
+            else
+              echo "| Tag now at | \`${COMMIT}\` |"
+            fi
+            echo ""
+            echo "Files stamped:"
+            printf '%s\n' "$FILES" | sed 's/^/- `/; s/$/`/'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
