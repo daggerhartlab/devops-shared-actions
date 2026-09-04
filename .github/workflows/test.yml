@@ -395,3 +395,159 @@ jobs:
           [ "$(git rev-parse --is-shallow-repository)" = "true" ] \
             || { echo "::error::fixture clone is not shallow - the assertion below would be meaningless"; exit 1; }
           echo "shallow fixture confirmed; the action's guard reads this same flag"
+
+  wp-plugin-version:
+    name: WP plugin version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The action refuses a shallow checkout, since it cannot push from
+          # one. Running with fetch-depth: 0 also asserts the guard does not
+          # misfire on a normal full checkout.
+          fetch-depth: 0
+
+      # A plugin fixture with two deliberate traps: a second "Version:" further
+      # down the file that must not be rewritten, and a vendor/ PHP file with a
+      # Plugin Name header that must not be mistaken for the entry file. The
+      # files are committed because discovery reads tracked files only.
+      - name: Build a WordPress plugin fixture
+        run: |
+          cat > wpfix-plugin.php <<'PHP'
+          <?php
+          /**
+           * Plugin Name: WP Fixture
+           * Version: 0.1.0
+           */
+
+          // Changelog reference that must survive untouched:
+          // Version: 9.9.9-DECOY
+          PHP
+          cat > readme.txt <<'TXT'
+          === WP Fixture ===
+          Contributors: fixture
+          Stable tag: 0.1.0
+          License: GPL-3.0+
+          TXT
+          mkdir -p vendor
+          cat > vendor/decoy.php <<'PHP'
+          <?php
+          /**
+           * Plugin Name: Vendor Decoy
+           * Version: 0.0.1
+           */
+          PHP
+          git config user.name 'fixture'
+          git config user.email 'fixture@example.com'
+          git add wpfix-plugin.php readme.txt vendor/decoy.php
+          git commit -q -m 'Test fixture'
+
+      - name: Run wp-plugin-version (stamp path)
+        id: stamp
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.9'
+          dry_run: 'true'
+
+      - name: Assert the stamp path
+        env:
+          STAMPED: ${{ steps.stamp.outputs.stamped }}
+          VERSION: ${{ steps.stamp.outputs.version }}
+          PLUGIN_FILE: ${{ steps.stamp.outputs.plugin_file }}
+          README_UPDATED: ${{ steps.stamp.outputs.readme_updated }}
+          COMMIT: ${{ steps.stamp.outputs.commit }}
+        run: |
+          fail=0
+          [ "$STAMPED" = "true" ]              || { echo "::error::expected stamped=true, got '$STAMPED'"; fail=1; }
+          [ "$VERSION" = "9.9.9" ]             || { echo "::error::expected version=9.9.9, got '$VERSION'"; fail=1; }
+          [ "$README_UPDATED" = "true" ]       || { echo "::error::expected readme_updated=true, got '$README_UPDATED'"; fail=1; }
+          [ -n "$COMMIT" ]                     || { echo "::error::commit is empty - the packaging commit should be made even on a dry run"; fail=1; }
+
+          # Discovery must pick the root entry file, not the vendored decoy.
+          [ "$PLUGIN_FILE" = "wpfix-plugin.php" ] || { echo "::error::expected plugin_file=wpfix-plugin.php, got '$PLUGIN_FILE'"; fail=1; }
+
+          # The header must be rewritten in place, keeping its docblock prefix.
+          grep -qxF " * Version: 9.9.9" wpfix-plugin.php || { echo "::error::plugin header was not stamped, or lost its ' * ' prefix"; fail=1; }
+          grep -qxF "Stable tag: 9.9.9" readme.txt       || { echo "::error::readme Stable tag was not stamped"; fail=1; }
+
+          # Only the FIRST Version: match may change. This is the assertion that
+          # catches a sed/perl replacement rewriting every occurrence.
+          grep -qxF "// Version: 9.9.9-DECOY" wpfix-plugin.php || { echo "::error::the decoy Version line was rewritten - only the first match may change"; fail=1; }
+          [ "$(grep -c 'Version:' wpfix-plugin.php)" = "2" ]   || { echo "::error::expected exactly 2 Version: lines, got $(grep -c 'Version:' wpfix-plugin.php)"; fail=1; }
+
+          # The vendored file must be untouched entirely.
+          grep -qxF " * Version: 0.0.1" vendor/decoy.php || { echo "::error::vendor/decoy.php was modified"; fail=1; }
+
+          echo "committed as: $(git --no-pager log -1 --format='%an <%ae>')"
+          exit "$fail"
+
+      - name: Run wp-plugin-version (idempotent no-op path)
+        id: noop
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.9'
+          dry_run: 'true'
+
+      - name: Assert the no-op path
+        env:
+          STAMPED: ${{ steps.noop.outputs.stamped }}
+          COMMIT: ${{ steps.noop.outputs.commit }}
+        run: |
+          fail=0
+          [ "$STAMPED" = "false" ] || { echo "::error::expected stamped=false on a re-run, got '$STAMPED'"; fail=1; }
+          [ -z "$COMMIT" ]         || { echo "::error::no-op still produced a commit: $COMMIT"; fail=1; }
+          echo "no-op path clean"
+          exit "$fail"
+
+      # Two root-level entry files is malformed, and guessing between them would
+      # stamp the wrong plugin. The action must refuse and name the input that
+      # resolves it.
+      - name: Add a second root-level plugin file
+        run: |
+          cat > second-plugin.php <<'PHP'
+          <?php
+          /**
+           * Plugin Name: Second Fixture
+           * Version: 0.0.1
+           */
+          PHP
+          git add second-plugin.php
+          git commit -q -m 'Ambiguous second entry file'
+
+      - name: Run wp-plugin-version with an ambiguous entry file
+        id: ambiguous
+        continue-on-error: true
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.11'
+          dry_run: 'true'
+
+      - name: Assert the ambiguity guard fired
+        env:
+          OUTCOME: ${{ steps.ambiguous.outcome }}
+        run: |
+          [ "$OUTCOME" = "failure" ] \
+            || { echo "::error::expected failure with two root-level plugin files, got '$OUTCOME'"; exit 1; }
+          echo "ambiguity guard fired as expected"
+
+      # Naming the entry file explicitly must resolve that ambiguity.
+      - name: Run wp-plugin-version with plugin_file set
+        id: explicit
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.11'
+          plugin_file: second-plugin.php
+          dry_run: 'true'
+
+      - name: Assert plugin_file overrode discovery
+        env:
+          STAMPED: ${{ steps.explicit.outputs.stamped }}
+          PLUGIN_FILE: ${{ steps.explicit.outputs.plugin_file }}
+        run: |
+          fail=0
+          [ "$STAMPED" = "true" ]                     || { echo "::error::expected stamped=true, got '$STAMPED'"; fail=1; }
+          [ "$PLUGIN_FILE" = "second-plugin.php" ]    || { echo "::error::expected plugin_file=second-plugin.php, got '$PLUGIN_FILE'"; fail=1; }
+          grep -qxF " * Version: 9.9.11" second-plugin.php || { echo "::error::second-plugin.php was not stamped"; fail=1; }
+          # The first plugin must be left at the earlier version.
+          grep -qxF " * Version: 9.9.9" wpfix-plugin.php   || { echo "::error::wpfix-plugin.php was stamped when plugin_file named another file"; fail=1; }
+          exit "$fail"

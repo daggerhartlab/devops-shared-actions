@@ -168,12 +168,13 @@ runs:
 
         for file in "${files[@]}"; do
           # Remove any previous stamp first, so a re-run replaces the block
-          # instead of appending a second one.
-          sed -i \
-            -e '/^# Information added by the release workflow on /d' \
-            -e '/^version:/d' \
-            -e '/^datestamp:/d' \
-            "$file"
+          # instead of appending a second one. Perl rather than sed because
+          # sed's in-place flag differs between GNU and BSD, so `sed -i` alone
+          # breaks on a macOS runner.
+          perl -ni -e 'print unless
+            m{^\# Information added by the release workflow on } ||
+            m{^version:} ||
+            m{^datestamp:}' "$file"
 
           # Collapse trailing newlines to exactly one before appending.
           perl -0pi -e 's/\n+\z/\n/' "$file"

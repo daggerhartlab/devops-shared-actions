@@ -24,6 +24,9 @@ every example below uses.
 - [`drupal-module-version`](#drupal-module-version) — stamps a release
   version and datestamp into a custom Drupal module's `*.info.yml` and moves
   the tag onto the packaging commit.
+- [`wp-plugin-version`](#wp-plugin-version) — stamps a release version into a
+  WordPress plugin's header and `readme.txt` Stable tag, and moves the tag
+  onto the packaging commit.
 
 All are composite actions; see each `action.yml` for the full,
 authoritative list of inputs and defaults. This README covers common usage
@@ -450,6 +453,75 @@ Outputs: `stamped`, `version`, `datestamp`, `files`, `commit`.
   single-module repo wants. Git's pathspec glob crosses directory
   separators, so submodules nested under the path are included either way.
 
+## `wp-plugin-version`
+
+Gives a WordPress plugin its release version. Git Updater decides whether an
+update is available by reading the `Version:` header from the remote file and
+comparing it to the installed one — an update only appears when remote is
+greater. So a repo that tags releases without bumping that header never offers
+an update at all: the header in tag `1.0.0` still reads `0.1.0`, which equals
+what is installed. WordPress core reads the same header for the plugins screen.
+
+On a version tag this writes the version into the plugin header, updates
+`readme.txt`'s Stable tag when there is one, commits, and moves the tag onto
+that commit. Git Updater installs from the tag's tree, so the version has to be
+in that tree to reach the installed plugin.
+
+```yaml
+name: Stamp Release Version
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: write
+
+jobs:
+  stamp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Required — the action pushes, and a shallow clone cannot be
+          # pushed from. The action fails fast if you forget.
+          fetch-depth: 0
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/wp-plugin-version@v1
+```
+
+That is the whole consumer, and it needs no per-plugin configuration: the entry
+file is discovered by looking for the root-level `*.php` carrying a
+`Plugin Name:` header, which is how WordPress itself identifies one.
+
+Outputs: `stamped`, `version`, `plugin_file`, `readme_updated`, `commit`.
+
+### Gotchas
+
+- **`readme.txt`'s Stable tag is hygiene, not machinery.** It plays no part in
+  Git Updater's comparison — that is the header's job. It is what
+  wordpress.org uses to pick the released version, so it is inert for a
+  privately distributed plugin but becomes load-bearing the moment one is
+  published. A missing readme, or one with no `Stable tag:` line, is a clean
+  skip rather than an error.
+- **Only the first `Version:` match is rewritten.** A changelog entry, a
+  string, or a docblock further down the file is left alone.
+- **A committed `vendor/` is safe.** Discovery only looks at root-level PHP
+  files, so a vendored package carrying its own `Plugin Name:` header is never
+  mistaken for the entry file. Two root-level candidates is an error naming
+  the `plugin_file` input, rather than a guess.
+- **The default branch keeps the previous version between releases**, since
+  only the tag is stamped. That is the opposite of the common WordPress habit
+  of bumping the header on the default branch and then tagging. Functionally
+  it makes no difference — Git Updater reads the tag, not the branch.
+- **It moves the tag**, with the same consequences as
+  [`drupal-module-version`](#drupal-module-version): tag protection rules will
+  block it, and anyone who fetched the tag beforehand needs
+  `git fetch --tags --force`.
+- **No datestamp.** That is a drupal.org packaging convention with no
+  WordPress equivalent.
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -465,6 +537,7 @@ once `v1` is moved onto it.
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key, that a re-run is a no-op, that a changed version replaces rather than accumulates, and that a run with no version on a branch fails |
+| `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, asserts only the first match is rewritten and the entry file is discovered correctly, that a re-run is a no-op, that two root-level entry files is an error, and that `plugin_file` resolves it |
 
 Two things worth knowing if you extend this:
 
