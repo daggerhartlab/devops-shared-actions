@@ -1,5 +1,5 @@
 name: "Drupal Module Version"
-description: "Stamps a release version and datestamp into a custom Drupal module's *.info.yml files, then moves the tag onto the resulting packaging commit."
+description: "Stamps a release version and datestamp into a custom Drupal module's *.info.yml files, commits, and creates the release tag on that packaging commit."
 
 # Why this exists:
 # Drupal reads an extension's version from its *.info.yml. drupal.org's
@@ -9,49 +9,48 @@ description: "Stamps a release version and datestamp into a custom Drupal module
 # is in the second category: Drupal shows no version, and anything reporting on
 # the site sees null.
 #
-# This closes that gap the same way drupal.org does. On a version tag, write the
-# version and datestamp into every info file, commit, and move the tag onto that
-# commit. The default branch stays unversioned, matching the convention that a
-# version exists only in a packaged release.
+# This closes that gap the same way drupal.org does: write the version and
+# datestamp into every info file, commit, and tag that commit. The packaging
+# commit is never pushed to a branch, so the default branch stays unversioned.
 #
-# Why the tag is moved rather than a release asset built:
-# Composer installs a git-sourced package by cloning the tag, so a tarball
-# attached to a GitHub Release is never fetched and stamping one would leave the
-# installed module unversioned. Moving the tag is what puts the version in front
-# of Composer.
+# Why the action creates the tag rather than reacting to one:
+# Composer installs a git-sourced package by cloning the tag, so the version
+# has to be in the tag's tree. Packagist records a tag's commit the moment the
+# tag is pushed and never re-reads it, so the tag must be born on the stamped
+# commit - it can never be moved there afterwards.
 #
 # Why "project" is never written:
-# drupal.org's script also adds `project: <name>`. A project key marks an
-# extension as contrib, so fleet tooling resolves it against drupal.org - which
-# for a private module is a lookup that can only fail. Version and datestamp
-# give the useful half without that side effect. There is deliberately no input
-# to turn this on.
+# A project key marks an extension as contrib, so fleet tooling resolves it
+# against drupal.org - which for a private module is a lookup that can only
+# fail. There is deliberately no input to turn this on.
 
 inputs:
   version:
-    description: 'Version to stamp, e.g. 1.0.0. Leave unset to derive it from the tag that triggered the run, stripping any leading "v". Set it to stamp from a workflow_dispatch, or to exercise the action without tagging.'
-    required: false
-    default: ''
+    description: 'Required. The release tag to create, e.g. 1.2.0 or v1.2.0. A leading "v" is kept in the tag name and stripped from the stamped version. Must not already exist.'
+    required: true
   module_path:
     description: 'Restrict stamping to this subtree, relative to the repo root. Leave unset to stamp every tracked *.info.yml, which is what a single-module repository wants.'
     required: false
     default: ''
   token:
-    description: 'Token used to push the moved tag. Leave unset to use the workflow GITHUB_TOKEN - a push made with GITHUB_TOKEN does not re-trigger workflows, which is what stops a tag-push trigger from looping. Pass a PAT only if the moved tag must fire other workflows; the idempotency guard keeps that terminating after one no-op run.'
+    description: 'Token used to push the tag. Leave unset to use the workflow GITHUB_TOKEN. Pass a PAT only if the new tag must trigger other workflows, since a push made with GITHUB_TOKEN does not.'
     required: false
     default: ''
   dry_run:
-    description: "Do everything except push the moved tag. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    description: "Do everything except push the tag. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
 
 outputs:
   stamped:
-    description: "'true' if info files were changed and committed, 'false' when the tag was not version-shaped or the version was already present."
+    description: "'true' if info files were changed and committed, 'false' when the checked-out commit already carried the version."
     value: ${{ steps.stamp.outputs.stamped }}
   version:
-    description: 'The version written, empty when nothing was stamped.'
+    description: 'The version written into the info files.'
     value: ${{ steps.resolve.outputs.version }}
+  tag:
+    description: 'The tag created.'
+    value: ${{ steps.resolve.outputs.tag }}
   datestamp:
     description: 'The Unix timestamp written alongside the version, empty when nothing was stamped.'
     value: ${{ steps.stamp.outputs.datestamp }}
@@ -59,8 +58,8 @@ outputs:
     description: 'Newline-separated list of the info files stamped, empty when nothing was stamped.'
     value: ${{ steps.stamp.outputs.files }}
   commit:
-    description: 'SHA of the packaging commit the tag now points at, empty on a dry run or a no-op.'
-    value: ${{ steps.commit.outputs.commit }}
+    description: 'SHA of the commit the tag points at.'
+    value: ${{ steps.tag.outputs.commit }}
 
 runs:
   using: "composite"
@@ -68,55 +67,54 @@ runs:
     - name: Check the checkout can be pushed from
       shell: bash
       run: |
-        # actions/checkout is shallow by default and a shallow clone cannot be
-        # pushed from. Failing here, naming the fix, beats a cryptic push error
-        # after the commit has already been made.
         if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
           echo "::error::Repository was checked out shallow. Add 'fetch-depth: 0' to the actions/checkout step that runs before this action."
           exit 1
         fi
 
-    - name: Resolve the version
+    - name: Resolve the version and tag
       id: resolve
       shell: bash
       env:
         VERSION_INPUT: ${{ inputs.version }}
-        REF_NAME: ${{ github.ref_name }}
-        REF_TYPE: ${{ github.ref_type }}
       run: |
-        if [ -n "$VERSION_INPUT" ]; then
-          version="$VERSION_INPUT"
-          echo "Using the version input: ${version}"
-        else
-          if [ "$REF_TYPE" != "tag" ]; then
-            echo "::error::No version input given and this run was not triggered by a tag (ref_type='${REF_TYPE}'). Pass the version input, or trigger the workflow on a tag push."
-            exit 1
-          fi
-
-          version="${REF_NAME#v}"
-
-          # Only version-shaped tags are stamped, so a tag such as 'latest' or
-          # 'deploy-2026' is never written in as a version string.
-          case "$version" in
-            [0-9]*.[0-9]*) ;;
-            *)
-              echo "Tag '${REF_NAME}' is not version-shaped - nothing to stamp."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
-
-          echo "Resolved version '${version}' from tag '${REF_NAME}'."
+        tag="$VERSION_INPUT"
+        if [ -z "$tag" ]; then
+          echo "::error::The version input is required, e.g. 'version: \${{ inputs.version }}' from a workflow_dispatch input."
+          exit 1
         fi
 
+        version="${tag#v}"
+        case "$version" in
+          [0-9]*.[0-9]*) ;;
+          *)
+            echo "::error::'${tag}' is not version-shaped. Expected something like 1.2.0 or v1.2.0."
+            exit 1
+            ;;
+        esac
+
+        if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+          echo "::error::Tag '${tag}' already exists. Release tags are never moved - pick a new version."
+          exit 1
+        fi
+
+        # Exit 2 means "no such ref"; anything else non-zero is a failed query.
+        rc=0
+        git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null || rc=$?
+        case "$rc" in
+          0) echo "::error::Tag '${tag}' already exists on origin. Release tags are never moved - pick a new version."; exit 1 ;;
+          2) ;;
+          *) echo "::error::Could not query origin for existing tags (git ls-remote exit ${rc})."; exit 1 ;;
+        esac
+
+        echo "Releasing version '${version}' as tag '${tag}'."
         {
           echo "version=${version}"
-          echo "tag=${REF_NAME}"
+          echo "tag=${tag}"
         } >> "$GITHUB_OUTPUT"
 
     - name: Stamp the info files
       id: stamp
-      if: ${{ steps.resolve.outputs.skip != 'true' }}
       shell: bash
       env:
         VERSION: ${{ steps.resolve.outputs.version }}
@@ -125,10 +123,9 @@ runs:
         datestamp="$(date -u +%s)"
         today="$(date -u +%Y-%m-%d)"
 
-        # A read loop rather than mapfile: mapfile is a bash 4 builtin and
-        # GitHub's macOS runners still ship bash 3.2. Note git's pathspec glob
-        # crosses directory separators, so this also catches submodules nested
-        # under module_path.
+        # A read loop rather than mapfile: GitHub's macOS runners ship bash 3.2.
+        # Git's pathspec glob crosses directory separators, so this also catches
+        # submodules nested under module_path.
         files=()
         if [ -n "$MODULE_PATH" ]; then
           pathspec="${MODULE_PATH%/}/*.info.yml"
@@ -148,16 +145,13 @@ runs:
           exit 1
         fi
 
-        # Idempotency. A push made with GITHUB_TOKEN does not re-trigger
-        # workflows, so the tag move cannot loop on its own; this guard keeps
-        # that true when a PAT is used instead, where that protection is gone.
         needs_work=false
         for file in "${files[@]}"; do
           grep -qxF "version: '${VERSION}'" "$file" || needs_work=true
         done
 
         if [ "$needs_work" = false ]; then
-          echo "Every info file already carries version '${VERSION}' - nothing to do."
+          echo "Every info file already carries version '${VERSION}' - tagging the checked-out commit as is."
           {
             echo "stamped=false"
             echo "datestamp="
@@ -167,10 +161,8 @@ runs:
         fi
 
         for file in "${files[@]}"; do
-          # Remove any previous stamp first, so a re-run replaces the block
-          # instead of appending a second one. Perl rather than sed because
-          # sed's in-place flag differs between GNU and BSD, so `sed -i` alone
-          # breaks on a macOS runner.
+          # Remove any previous stamp so it is replaced rather than appended.
+          # Perl because `sed -i` differs between GNU and BSD.
           perl -ni -e 'print unless
             m{^\# Information added by the release workflow on } ||
             m{^version:} ||
@@ -200,7 +192,6 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     - name: Commit the packaging change
-      id: commit
       if: ${{ steps.stamp.outputs.stamped == 'true' }}
       shell: bash
       env:
@@ -209,11 +200,8 @@ runs:
         VERSION: ${{ steps.resolve.outputs.version }}
         MODULE_PATH: ${{ inputs.module_path }}
       run: |
-        # The <id>+<login>@users.noreply.github.com form links the commit back
-        # to a GitHub profile, so the packaging commit is attributed to whoever
-        # pushed the tag. Do not also pass configure_git_identity to
-        # setup-runner: that sets the identity from the last commit's author and
-        # would win or lose depending on step order.
+        # Attributes the packaging commit to whoever ran the release. Do not
+        # also pass configure_git_identity to setup-runner.
         git config user.name "$ACTOR"
         git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
 
@@ -232,26 +220,32 @@ runs:
         git commit -m "Set version ${VERSION} for release"
         git --no-pager log -1 --format='committed %h by %an <%ae>'
 
+    - name: Tag the release commit
+      id: tag
+      shell: bash
+      env:
+        TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        git tag "$TAG"
         echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "Tagged $(git rev-parse --short HEAD) as '${TAG}'."
 
-    - name: Move the tag onto the packaging commit
-      if: ${{ steps.stamp.outputs.stamped == 'true' && contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
+    - name: Push the tag
+      if: ${{ contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
       shell: bash
       env:
         TOKEN: ${{ inputs.token || github.token }}
         REPO: ${{ github.repository }}
         TAG: ${{ steps.resolve.outputs.tag }}
       run: |
-        # Set the remote explicitly so the chosen token is what authenticates
-        # the push, rather than whatever credentials actions/checkout persisted.
+        # Set the remote explicitly so the chosen token authenticates the push,
+        # rather than whatever credentials actions/checkout persisted.
         git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 
-        # The commit that was originally tagged stays reachable through its
-        # branch, so an existing composer.lock pinning it is never orphaned.
-        git tag -f "$TAG"
-        git push --force origin "refs/tags/${TAG}"
+        # No --force: if the tag appeared since the check above, fail.
+        git push origin "refs/tags/${TAG}"
 
-        echo "Tag '${TAG}' now points at $(git rev-parse HEAD)."
+        echo "Pushed tag '${TAG}'."
 
     - name: Summary
       shell: bash
@@ -260,32 +254,26 @@ runs:
         VERSION: ${{ steps.resolve.outputs.version }}
         DATESTAMP: ${{ steps.stamp.outputs.datestamp }}
         FILES: ${{ steps.stamp.outputs.files }}
-        COMMIT: ${{ steps.commit.outputs.commit }}
+        COMMIT: ${{ steps.tag.outputs.commit }}
         TAG: ${{ steps.resolve.outputs.tag }}
         DRY_RUN: ${{ inputs.dry_run }}
       run: |
         {
           echo "### Drupal module version"
           echo ""
-          if [ "$STAMPED" != "true" ]; then
-            if [ -z "$VERSION" ]; then
-              echo "Tag \`${TAG}\` is not version-shaped - nothing stamped."
-            else
-              echo "Version \`${VERSION}\` was already stamped - nothing to do."
-            fi
-          else
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Version | \`${VERSION}\` |"
-            echo "| Datestamp | \`${DATESTAMP}\` |"
-            echo "| Tag | \`${TAG}\` |"
-            if [ -n "$DRY_RUN" ] && ! printf '%s' "$DRY_RUN" | grep -qiE '^(false|0|no|off)$'; then
-              echo "| Tag moved | _skipped (dry run)_ |"
-            else
-              echo "| Tag now at | \`${COMMIT}\` |"
-            fi
-            echo ""
-            echo "Files stamped:"
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Version | \`${VERSION}\` |"
+          echo "| Tag | \`${TAG}\` |"
+          echo "| Commit | \`${COMMIT}\` |"
+          if [ -n "$DRY_RUN" ] && ! printf '%s' "$DRY_RUN" | grep -qiE '^(false|0|no|off)$'; then
+            echo "| Pushed | _skipped (dry run)_ |"
+          fi
+          echo ""
+          if [ "$STAMPED" = "true" ]; then
+            echo "Stamped with datestamp \`${DATESTAMP}\`:"
             printf '%s\n' "$FILES" | sed 's/^/- `/; s/$/`/'
+          else
+            echo "Version was already present - tagged the checked-out commit without a packaging commit."
           fi
         } >> "$GITHUB_STEP_SUMMARY"
