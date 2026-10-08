@@ -397,6 +397,9 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/drupal-module-version
         with:
+          # Explicitly empty: omitting it fails actionlint, and the runner
+          # does not enforce required inputs on composite actions.
+          version: ''
           module_path: modfix
           dry_run: 'true'
 
