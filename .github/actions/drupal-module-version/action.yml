@@ -80,7 +80,7 @@ runs:
       run: |
         tag="$VERSION_INPUT"
         if [ -z "$tag" ]; then
-          echo "::error::The version input is required, e.g. 'version: \${{ inputs.version }}' from a workflow_dispatch input."
+          echo "::error::The version input is required. Pass it from a workflow_dispatch input."
           exit 1
         fi
 
