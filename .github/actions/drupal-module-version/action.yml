@@ -33,11 +33,15 @@ inputs:
     required: false
     default: ''
   token:
-    description: 'Token used to push the tag. Leave unset to use the workflow GITHUB_TOKEN. Pass a PAT only if the new tag must trigger other workflows, since a push made with GITHUB_TOKEN does not.'
+    description: 'Token used to push the tag and create the release. Leave unset to use the workflow GITHUB_TOKEN. Pass a PAT only if the new tag or release must trigger other workflows, since anything done with GITHUB_TOKEN does not.'
     required: false
     default: ''
+  release:
+    description: "Create a GitHub Release for the tag, titled with the tag and carrying GitHub's generated release notes. A version containing a hyphen, e.g. 1.3.0-beta1, is marked as a pre-release. On by default; 'false'/'0'/'no'/'off' disable."
+    required: false
+    default: 'true'
   dry_run:
-    description: "Do everything except push the tag. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    description: "Do everything except push the tag and create the release. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
 
@@ -60,6 +64,9 @@ outputs:
   commit:
     description: 'SHA of the commit the tag points at.'
     value: ${{ steps.tag.outputs.commit }}
+  release_url:
+    description: 'URL of the GitHub Release, empty when none was created.'
+    value: ${{ steps.release.outputs.url }}
 
 runs:
   using: "composite"
@@ -247,6 +254,23 @@ runs:
 
         echo "Pushed tag '${TAG}'."
 
+    - name: Create the GitHub Release
+      id: release
+      if: ${{ contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) && !contains(fromJSON('["false", "0", "no", "off"]'), inputs.release) }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ steps.resolve.outputs.tag }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+      run: |
+        args=(--verify-tag --title "$TAG" --generate-notes)
+        case "$VERSION" in *-*) args+=(--prerelease) ;; esac
+
+        url="$(gh release create "$TAG" "${args[@]}")"
+        echo "url=${url}" >> "$GITHUB_OUTPUT"
+        echo "Created release ${url}"
+
     - name: Summary
       shell: bash
       env:
@@ -256,6 +280,7 @@ runs:
         FILES: ${{ steps.stamp.outputs.files }}
         COMMIT: ${{ steps.tag.outputs.commit }}
         TAG: ${{ steps.resolve.outputs.tag }}
+        RELEASE_URL: ${{ steps.release.outputs.url }}
         DRY_RUN: ${{ inputs.dry_run }}
       run: |
         {
@@ -268,6 +293,9 @@ runs:
           echo "| Commit | \`${COMMIT}\` |"
           if [ -n "$DRY_RUN" ] && ! printf '%s' "$DRY_RUN" | grep -qiE '^(false|0|no|off)$'; then
             echo "| Pushed | _skipped (dry run)_ |"
+          fi
+          if [ -n "$RELEASE_URL" ]; then
+            echo "| Release | ${RELEASE_URL} |"
           fi
           echo ""
           if [ "$STAMPED" = "true" ]; then

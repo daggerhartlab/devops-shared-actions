@@ -302,6 +302,7 @@ jobs:
           DATESTAMP: ${{ steps.stamp.outputs.datestamp }}
           COMMIT: ${{ steps.stamp.outputs.commit }}
           FIXTURE: ${{ steps.fixture.outputs.sha }}
+          RELEASE_URL: ${{ steps.stamp.outputs.release_url }}
         run: |
           fail=0
           [ "$STAMPED" = "true" ]  || { echo "::error::expected stamped=true, got '$STAMPED'"; fail=1; }
@@ -329,6 +330,7 @@ jobs:
 
           # dry_run must not have pushed the tag.
           [ -z "$(git ls-remote --tags origin refs/tags/9.9.9)" ] || { echo "::error::dry run pushed tag 9.9.9"; fail=1; }
+          [ -z "$RELEASE_URL" ] || { echo "::error::dry run created a release: $RELEASE_URL"; fail=1; }
           echo "committed as: $(git --no-pager log -1 --format='%an <%ae>')"
           exit "$fail"
 

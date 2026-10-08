@@ -22,8 +22,8 @@ every example below uses.
 - [`wp-core-update`](#wp-core-update) — updates WordPress core files,
   verifies them against WordPress.org checksums, and opens a PR.
 - [`drupal-module-version`](#drupal-module-version) — stamps a release
-  version and datestamp into a custom Drupal module's `*.info.yml` and
-  creates the release tag on the packaging commit.
+  version and datestamp into a custom Drupal module's `*.info.yml`, creates
+  the release tag on the packaging commit, and publishes a GitHub Release.
 - [`wp-plugin-version`](#wp-plugin-version) — stamps a release version into a
   WordPress plugin's header and `readme.txt` Stable tag, and moves the tag
   onto the packaging commit.
@@ -391,8 +391,9 @@ category, so Drupal shows no version and anything reporting on the site sees
 `null`.
 
 This action does the same job as a release step you run by hand: write the
-version and datestamp into every info file, commit, and create the release tag
-on that commit. The packaging commit is only reachable through the tag, so the
+version and datestamp into every info file, commit, create the release tag
+on that commit, and publish a GitHub Release for it with GitHub's generated
+"What's Changed" notes. The packaging commit is only reachable through the tag, so the
 default branch stays unversioned.
 
 ```yaml
@@ -428,7 +429,11 @@ release from and entering the version. Drop it into any custom module
 repository unchanged: the info files are found by glob, so nothing is
 hardcoded per module.
 
-Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`.
+Pass `release: false` to stop at the tag. A version containing a hyphen, such
+as `1.3.0-beta1`, is published as a pre-release.
+
+Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`,
+`release_url`.
 
 ### Gotchas
 
@@ -453,9 +458,13 @@ Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`.
 - **An existing stamp is replaced, not appended to.** If the checked-out
   commit already carries the version, it is tagged as is with no packaging
   commit (`stamped=false`).
-- **The tag push won't trigger other workflows** when made with the default
-  `GITHUB_TOKEN`. Pass a PAT as `token` if something else must run on the new
-  tag. Packagist's webhook is unaffected either way.
+- **The tag push and release won't trigger other workflows** when made with
+  the default `GITHUB_TOKEN`, so an `on: release` workflow will not fire. Pass
+  a PAT as `token` if something else must run on them. Packagist's webhook is
+  unaffected either way.
+- **Release notes list pull requests merged since the previous release.**
+  Commits pushed straight to the branch only show up in the "Full Changelog"
+  compare link.
 - **`module_path` is for repos holding more than one module.** Left unset,
   every tracked `*.info.yml` in the repo is stamped, which is what a
   single-module repo wants. Git's pathspec glob crosses directory
@@ -542,7 +551,7 @@ once `v1` is moved onto it.
 | `all-tools` | Everything enabled at once; asserts each binary landed, git identity was set, and `wp_cli_version` was honored |
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
-| `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
+| `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, asserts only the first match is rewritten and the entry file is discovered correctly, that a re-run is a no-op, that two root-level entry files is an error, and that `plugin_file` resolves it |
 
 Two things worth knowing if you extend this:
