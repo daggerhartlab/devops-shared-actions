@@ -1,7 +1,11 @@
 name: "Site build"
-description: "Builds site dependencies for deployment: Composer (no-dev), an optional Laravel Mix theme build, and optional artifact-repo prep (e.g. Pantheon, Acquia)."
+description: "Builds site dependencies for deployment: Composer (no-dev), optional theme Composer install, an optional Laravel Mix theme build, and optional artifact-repo prep (e.g. Pantheon, Acquia)."
 
 inputs:
+  theme_composer_path:
+    description: 'Path (relative to repo root) to a theme directory with its own composer.json, e.g. web/wp-content/themes/my_theme. If set, runs `composer install --no-dev` in that directory. Independent of laravel_mix_theme_path. Leave unset to skip.'
+    required: false
+    default: ''
   laravel_mix_theme_path:
     description: 'Path (relative to repo root) to a theme directory that uses Laravel Mix, e.g. web/themes/custom/my_theme. If set, runs `npm ci` and `npx mix --production` in that directory, then removes node_modules. Leave unset to skip the theme build entirely.'
     required: false
@@ -23,6 +27,15 @@ runs:
       shell: bash
       run: |
         composer install --optimize-autoloader --no-dev --prefer-dist --no-progress --no-suggest
+
+    # Build: Theme Composer
+    - name: Install theme dependencies
+      if: ${{ inputs.theme_composer_path != '' }}
+      shell: bash
+      env:
+        THEME_COMPOSER_PATH: ${{ inputs.theme_composer_path }}
+      run: |
+        composer install --working-dir="$THEME_COMPOSER_PATH" --optimize-autoloader --no-dev --prefer-dist --no-progress --no-suggest
 
     # Build: Laravel Mix theme
     - name: Build Laravel Mix theme

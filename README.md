@@ -218,13 +218,14 @@ want the newer one; it won't drift on its own.
 
 ## `site-build`
 
-`composer install --no-dev` always runs. Three further steps are
+`composer install --no-dev` always runs. Four further steps are
 independently opt-in — each only runs if its own input is set, with no
 coupling between them:
 
 | Input | Step it enables |
 |---|---|
 | *(always runs)* | `composer install --no-dev` (production dependencies) |
+| `theme_composer_path` | `composer install --no-dev` in that theme directory (for themes with their own `composer.json`, e.g. Timber or Sage) |
 | `laravel_mix_theme_path` | `npm ci && npx mix --production` in that theme directory, then deletes its `node_modules` |
 | `artifact_repo_gitignore` | Replace `.gitignore` with the given file |
 | `artifact_repo_cleanup_paths` | Remove nested `.git` directories under the given paths |
@@ -240,6 +241,23 @@ the deployable artifact, but it also means any npm step you run *after*
   with:
     laravel_mix_theme_path: web/themes/custom/my_theme
 ```
+
+### Theme with its own Composer dependencies
+
+Some themes (Timber, Sage) keep a `composer.json` of their own. Set
+`theme_composer_path` to install it; it's separate from
+`laravel_mix_theme_path`, so it also works for themes built some other way.
+Usually both point at the same directory:
+
+```yaml
+- uses: daggerhartlab/devops-shared-actions/.github/actions/site-build@v1
+  with:
+    theme_composer_path: web/wp-content/themes/my_theme
+    laravel_mix_theme_path: web/wp-content/themes/my_theme
+```
+
+The theme's `vendor/` must not be ignored by the artifact repo's
+`.gitignore`, or it won't be deployed.
 
 ### Preparing a git-based artifact repo only (no theme)
 
