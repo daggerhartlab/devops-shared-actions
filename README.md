@@ -308,9 +308,10 @@ push. `commit` is the checked-out `HEAD`, not the artifact repo's commit.
 
 The file only exists on the runner, so add it to the dev repo's
 `.gitignore` to keep a stray local copy out, and make sure the artifact
-repo's `.gitignore` doesn't match it. Inside the docroot (e.g. at the root
-of a WordPress repo) it's publicly readable; put it outside the docroot if
-that matters.
+repo's `.gitignore` doesn't match it. Whether a dotfile inside the docroot
+is web-readable depends on the host; Pantheon blocks it, so
+`.deploy-version.json` at the root of a WordPress repo is not publicly
+served there.
 
 ### Both together
 
