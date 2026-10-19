@@ -17,8 +17,8 @@ every example below uses.
 - [`setup-runner`](#setup-runner) — installs SSH, Node, PHP/Composer,
   Pantheon Terminus, Acquia CLI, WP-CLI, OpenVPN, Pandoc as needed.
 - [`site-build`](#site-build) — builds a deployable artifact: Composer
-  (no-dev), an optional Laravel Mix theme build, and optional git-based
-  artifact-repo prep.
+  (no-dev), an optional Laravel Mix theme build, optional git-based
+  artifact-repo prep, and an optional deploy version file.
 - [`wp-core-update`](#wp-core-update) — updates WordPress core files,
   verifies them against WordPress.org checksums, and opens a PR.
 - [`drupal-module-version`](#drupal-module-version) — stamps a release
@@ -218,7 +218,7 @@ want the newer one; it won't drift on its own.
 
 ## `site-build`
 
-`composer install --no-dev` always runs. Four further steps are
+`composer install --no-dev` always runs. Five further steps are
 independently opt-in — each only runs if its own input is set, with no
 coupling between them:
 
@@ -229,6 +229,7 @@ coupling between them:
 | `laravel_mix_theme_path` | `npm ci && npx mix --production` in that theme directory, then deletes its `node_modules` |
 | `artifact_repo_gitignore` | Replace `.gitignore` with the given file |
 | `artifact_repo_cleanup_paths` | Remove nested `.git` directories under the given paths |
+| `deploy_version_file` | Write a JSON record of this build to the given path |
 
 Note the `node_modules` deletion: it keeps build-time dependencies out of
 the deployable artifact, but it also means any npm step you run *after*
@@ -278,6 +279,38 @@ and `web/core` instead of ignoring them:
 `artifact_repo_cleanup_paths` takes a newline-separated list (composite
 actions have no native array input type — same convention `actions/cache`
 uses for its own `path:` input).
+
+### Recording what was deployed
+
+Set `deploy_version_file` to write a JSON file describing the build into
+the artifact, so a deployed site can report which source commit it's
+running and when it was built:
+
+```yaml
+- uses: daggerhartlab/devops-shared-actions/.github/actions/site-build@v1
+  with:
+    artifact_repo_gitignore: .gitignore.pantheon
+    deploy_version_file: .deploy-version.json
+```
+
+```json
+{
+  "deployed_at": "2026-10-19T17:42:03Z",
+  "commit": "35c33de54a1f…",
+  "repository": "daggerhartlab/my-site",
+  "actor": "jdaggerhart",
+  "run_url": "https://github.com/daggerhartlab/my-site/actions/runs/123456789"
+}
+```
+
+`deployed_at` is build time, which in a deploy job is seconds before the
+push. `commit` is the checked-out `HEAD`, not the artifact repo's commit.
+
+The file only exists on the runner, so add it to the dev repo's
+`.gitignore` to keep a stray local copy out, and make sure the artifact
+repo's `.gitignore` doesn't match it. Inside the docroot (e.g. at the root
+of a WordPress repo) it's publicly readable; put it outside the docroot if
+that matters.
 
 ### Both together
 

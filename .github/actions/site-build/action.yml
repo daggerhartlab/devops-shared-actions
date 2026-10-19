@@ -1,5 +1,5 @@
 name: "Site build"
-description: "Builds site dependencies for deployment: Composer (no-dev), optional theme Composer install, an optional Laravel Mix theme build, and optional artifact-repo prep (e.g. Pantheon, Acquia)."
+description: "Builds site dependencies for deployment: Composer (no-dev), optional theme Composer install, an optional Laravel Mix theme build, optional artifact-repo prep (e.g. Pantheon, Acquia), and an optional deploy version file."
 
 inputs:
   theme_composer_path:
@@ -16,6 +16,10 @@ inputs:
     default: ''
   artifact_repo_cleanup_paths:
     description: 'Newline-separated list of paths (relative to repo root, no leading ./) to scan for nested .git directories and remove, e.g. "web\nvendor" - useful before pushing to a git-based artifact deploy target (e.g. Pantheon, Acquia), which rejects nested repos. Leave unset to skip this step entirely.'
+    required: false
+    default: ''
+  deploy_version_file:
+    description: 'Path (relative to repo root) to write a JSON file recording this build: UTC timestamp, source commit, repository, actor, and run URL, e.g. .deploy-version.json. It must not be ignored by the artifact repo''s .gitignore, or it won''t be deployed. Leave unset to skip.'
     required: false
     default: ''
 
@@ -72,3 +76,20 @@ runs:
           [ -z "$cleanup_path" ] && continue
           find "$cleanup_path" -type d -name ".git" | xargs -r rm -fr
         done <<< "$ARTIFACT_CLEANUP_PATHS"
+
+    ## Write deploy version file
+    - name: Write deploy version file
+      if: ${{ inputs.deploy_version_file != '' }}
+      shell: bash
+      env:
+        DEPLOY_VERSION_FILE: ${{ inputs.deploy_version_file }}
+      run: |
+        mkdir -p "$(dirname "$DEPLOY_VERSION_FILE")"
+        jq -n \
+          --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg commit "$(git rev-parse HEAD)" \
+          --arg repository "$GITHUB_REPOSITORY" \
+          --arg actor "$GITHUB_ACTOR" \
+          --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          '$ARGS.named' > "$DEPLOY_VERSION_FILE"
+        cat "$DEPLOY_VERSION_FILE"
