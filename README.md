@@ -25,8 +25,8 @@ every example below uses.
   version and datestamp into a custom Drupal module's `*.info.yml`, creates
   the release tag on the packaging commit, and publishes a GitHub Release.
 - [`wp-plugin-version`](#wp-plugin-version) — stamps a release version into a
-  WordPress plugin's header and `readme.txt` Stable tag, and moves the tag
-  onto the packaging commit.
+  WordPress plugin's header and `readme.txt` Stable tag on its primary branch,
+  and pushes the branch with a new release tag on that commit.
 
 All are composite actions; see each `action.yml` for the full,
 authoritative list of inputs and defaults. This README covers common usage
@@ -524,31 +524,37 @@ Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`,
 
 ## `wp-plugin-version`
 
-Gives a WordPress plugin its release version. Git Updater decides whether an
-update is available by reading the `Version:` header from the remote file and
-comparing it to the installed one — an update only appears when remote is
-greater. So a repo that tags releases without bumping that header never offers
-an update at all: the header in tag `1.0.0` still reads `0.1.0`, which equals
-what is installed. WordPress core reads the same header for the plugins screen.
+Releases a WordPress plugin with its version in place. Git Updater decides
+whether an update is available by reading the `Version:` header from the
+remote file and comparing it to the installed one — an update only appears
+when remote is greater. That remote file is read from the plugin's **primary
+branch** (its `Primary Branch:` header, else the repository default branch),
+not from a tag: the newest tag is only used to build the download link, and
+Git Updater installs from that tag's tree. So a release needs the version in
+both places — on the branch so the update is detected, and in the tag so the
+installed plugin reports it. WordPress core reads the same header for the
+plugins screen.
 
-On a version tag this writes the version into the plugin header, updates
-`readme.txt`'s Stable tag when there is one, commits, and moves the tag onto
-that commit. Git Updater installs from the tag's tree, so the version has to be
-in that tree to reach the installed plugin.
+Run from the primary branch, this writes the version into the plugin header,
+updates `readme.txt`'s Stable tag when there is one, commits, tags that
+commit, and pushes the branch and the tag together. The tag is born on a
+commit that is already on the branch, and is never moved.
 
 ```yaml
-name: Stamp Release Version
+name: Release
 
 on:
-  push:
-    tags:
-      - '**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 1.2.0'
+        required: true
 
 permissions:
   contents: write
 
 jobs:
-  stamp:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -558,16 +564,47 @@ jobs:
           fetch-depth: 0
 
       - uses: daggerhartlab/devops-shared-actions/.github/actions/wp-plugin-version@v1
+        with:
+          version: ${{ inputs.version }}
 ```
 
-That is the whole consumer, and it needs no per-plugin configuration: the entry
-file is discovered by looking for the root-level `*.php` carrying a
-`Plugin Name:` header, which is how WordPress itself identifies one.
+To release, run the workflow from the Actions tab on the primary branch and
+enter the version, or `gh workflow run release.yml -f version=1.2.0`. It needs
+no per-plugin configuration: the entry file is discovered by looking for the
+root-level `*.php` carrying a `Plugin Name:` header, which is how WordPress
+itself identifies one.
 
-Outputs: `stamped`, `version`, `plugin_file`, `readme_updated`, `commit`.
+Bumping the header on the branch yourself first also works: the version is
+already there, so the checked-out commit is tagged without a packaging commit
+(a stale `readme.txt` Stable tag is still corrected).
+
+Inputs: `version` (required; a leading `v` is kept in the tag and stripped
+from the header), `plugin_file`, `token`, `dry_run` (commits and tags locally
+but pushes nothing).
+
+Outputs: `stamped`, `version`, `tag`, `branch`, `plugin_file`,
+`readme_updated`, `commit`.
 
 ### Gotchas
 
+- **Don't push release tags by hand.** A tag pushed before the header is
+  bumped points at a commit Git Updater will never offer. The action creates
+  the tag, and refuses one that already exists.
+- **It refuses to run off the primary branch.** Git Updater only reads the
+  version from that branch, so a release cut anywhere else would never be
+  offered.
+- **It refuses a lower version** than the branch already has, compared the
+  way Git Updater does (`1.0.0-beta1` is lower than `1.0.0`).
+- **It pushes to the primary branch.** A protected branch rejects a push
+  made with `GITHUB_TOKEN`, and GitHub Actions cannot be put on a ruleset's
+  bypass list. Pass a token from an actor that can bypass via `token` — a
+  GitHub App installation token (e.g. from `actions/create-github-app-token`)
+  with the app on the bypass list, or a PAT of a user whose role is. The branch and tag are pushed atomically, so a rejected push
+  leaves neither behind, and a branch that moved during the run is a
+  non-fast-forward rejection that a re-run fixes.
+- **Nothing it pushes triggers other workflows** when using `GITHUB_TOKEN` —
+  neither the tag nor the branch commit. Pass a PAT as `token` if, say, a
+  tag-push build must run.
 - **`readme.txt`'s Stable tag is hygiene, not machinery.** It plays no part in
   Git Updater's comparison — that is the header's job. It is what
   wordpress.org uses to pick the released version, so it is inert for a
@@ -580,12 +617,6 @@ Outputs: `stamped`, `version`, `plugin_file`, `readme_updated`, `commit`.
   files, so a vendored package carrying its own `Plugin Name:` header is never
   mistaken for the entry file. Two root-level candidates is an error naming
   the `plugin_file` input, rather than a guess.
-- **The default branch keeps the previous version between releases**, since
-  only the tag is stamped. That is the opposite of the common WordPress habit
-  of bumping the header on the default branch and then tagging. Functionally
-  it makes no difference — Git Updater reads the tag, not the branch.
-- **It moves the tag.** Tag protection rules will block it, and anyone who
-  fetched the tag beforehand needs `git fetch --tags --force`.
 - **No datestamp.** That is a drupal.org packaging convention with no
   WordPress equivalent.
 
@@ -604,7 +635,7 @@ once `v1` is moved onto it.
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
-| `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, asserts only the first match is rewritten and the entry file is discovered correctly, that a re-run is a no-op, that two root-level entry files is an error, and that `plugin_file` resolves it |
+| `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
 
 Two things worth knowing if you extend this:
 

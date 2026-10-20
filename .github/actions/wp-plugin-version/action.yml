@@ -1,19 +1,28 @@
 name: "WP Plugin Version"
-description: "Stamps a release version into a WordPress plugin's header (and readme.txt Stable tag), then moves the tag onto the resulting packaging commit."
+description: "Stamps a release version into a WordPress plugin's header (and readme.txt Stable tag) on its primary branch, commits, and pushes the branch together with a new release tag on that commit."
 
 # Why this exists:
 # Git Updater decides whether an update is available by reading the `Version:`
 # header from the remote file and comparing it to the installed one - an update
-# only appears when remote is greater. A repository that tags releases without
-# bumping that header therefore never offers an update at all: the header in
-# tag 1.0.0 still says 0.1.0, which equals what is installed. WordPress core
-# reads the same header for the plugins screen, and anything reporting on the
-# site reads it too.
+# only appears when remote is greater. That remote file is read from the
+# plugin's primary branch (its Primary Branch: header, else the repository
+# default), not from a tag; the newest tag is only used to build the download
+# link, and Git Updater installs from that tag's tree. So a release needs the
+# version in both places: on the primary branch, so the update is detected, and
+# in the tag's tree, so the installed plugin reports it. WordPress core reads
+# the same header for the plugins screen, and anything reporting on the site
+# reads it too.
 #
-# On a version tag this writes the version into the plugin header, updates
-# readme.txt's Stable tag when there is one, commits, and moves the tag onto
-# that commit. Git Updater installs from the tag's tree, so the version has to
-# be in that tree to reach the installed plugin.
+# Run from a workflow_dispatch on the primary branch, this writes the version
+# into the plugin header, updates readme.txt's Stable tag when there is one,
+# commits, tags that commit, and pushes the branch and the tag atomically.
+#
+# Why the action creates the tag rather than reacting to one:
+# A tag pushed first points at a commit without the version, and putting it
+# right means moving the tag and then chasing the branch - which may have moved
+# on, or never contained that commit. Stamping the branch first and tagging the
+# result means the tag is born on a commit that is already on the branch, and
+# is never moved.
 #
 # Why readme.txt's Stable tag is updated:
 # It plays no part in Git Updater's comparison - that is the header's job. It is
@@ -28,38 +37,43 @@ description: "Stamps a release version into a WordPress plugin's header (and rea
 
 inputs:
   version:
-    description: 'Version to stamp, e.g. 1.0.0. Leave unset to derive it from the tag that triggered the run, stripping any leading "v". Set it to stamp from a workflow_dispatch, or to exercise the action without tagging.'
-    required: false
-    default: ''
+    description: 'Required. The release tag to create, e.g. 1.2.0 or v1.2.0. A leading "v" is kept in the tag name and stripped from the stamped version. Must not already exist, and must not be lower than the version already on the branch.'
+    required: true
   plugin_file:
     description: 'Path to the main plugin file, relative to the repo root. Leave unset to discover it - the root-level *.php file carrying a "Plugin Name:" header, which is how WordPress itself identifies a plugin entry file.'
     required: false
     default: ''
   token:
-    description: 'Token used to push the moved tag. Leave unset to use the workflow GITHUB_TOKEN - a push made with GITHUB_TOKEN does not re-trigger workflows, which is what stops a tag-push trigger from looping. Pass a PAT only if the moved tag must fire other workflows; the idempotency guard keeps that terminating after one no-op run.'
+    description: 'Token used to push the branch and the tag. Leave unset to use the workflow GITHUB_TOKEN. A protected primary branch rejects a GITHUB_TOKEN push, and GitHub Actions cannot be added to a ruleset bypass list - pass a token from an actor that can bypass it instead, e.g. a GitHub App installation token or a PAT whose user role is on the bypass list. Pass a PAT also if the new tag or branch commit must trigger other workflows, since anything pushed with GITHUB_TOKEN does not.'
     required: false
     default: ''
   dry_run:
-    description: "Do everything except push the moved tag. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    description: "Do everything except push the branch and the tag. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
     required: false
     default: ''
 
 outputs:
   stamped:
-    description: "'true' if the version was written and committed, 'false' when the tag was not version-shaped or the version was already present."
+    description: "'true' if the version was written and committed, 'false' when the branch already carried it and the checked-out commit was tagged as is."
     value: ${{ steps.stamp.outputs.stamped }}
   version:
-    description: 'The version written, empty when nothing was stamped.'
+    description: 'The version written into the plugin header.'
     value: ${{ steps.resolve.outputs.version }}
+  tag:
+    description: 'The tag created.'
+    value: ${{ steps.resolve.outputs.tag }}
+  branch:
+    description: 'The primary branch the version was committed to.'
+    value: ${{ steps.resolve.outputs.branch }}
   plugin_file:
     description: 'The plugin file that was stamped, whether discovered or passed in.'
-    value: ${{ steps.stamp.outputs.plugin_file }}
+    value: ${{ steps.resolve.outputs.plugin_file }}
   readme_updated:
-    description: "'true' if a readme.txt Stable tag was updated, 'false' when there was no readme or no Stable tag line."
+    description: "'true' if a readme.txt Stable tag was updated, 'false' when there was no readme, no Stable tag line, or it was already current."
     value: ${{ steps.stamp.outputs.readme_updated }}
   commit:
-    description: 'SHA of the packaging commit the tag now points at, empty on a dry run or a no-op.'
-    value: ${{ steps.commit.outputs.commit }}
+    description: 'SHA of the commit the tag points at, which is also the new head of the branch.'
+    value: ${{ steps.tag.outputs.commit }}
 
 runs:
   using: "composite"
@@ -75,55 +89,44 @@ runs:
           exit 1
         fi
 
-    - name: Resolve the version
+    - name: Resolve the version, tag and branch
       id: resolve
       shell: bash
       env:
         VERSION_INPUT: ${{ inputs.version }}
+        PLUGIN_FILE_INPUT: ${{ inputs.plugin_file }}
         REF_NAME: ${{ github.ref_name }}
         REF_TYPE: ${{ github.ref_type }}
-      run: |
-        if [ -n "$VERSION_INPUT" ]; then
-          version="$VERSION_INPUT"
-          echo "Using the version input: ${version}"
-        else
-          if [ "$REF_TYPE" != "tag" ]; then
-            echo "::error::No version input given and this run was not triggered by a tag (ref_type='${REF_TYPE}'). Pass the version input, or trigger the workflow on a tag push."
-            exit 1
-          fi
-
-          version="${REF_NAME#v}"
-
-          # Only version-shaped tags are stamped, so a tag such as 'latest' or
-          # 'deploy-2026' is never written in as a version string.
-          case "$version" in
-            [0-9]*.[0-9]*) ;;
-            *)
-              echo "Tag '${REF_NAME}' is not version-shaped - nothing to stamp."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
-
-          echo "Resolved version '${version}' from tag '${REF_NAME}'."
-        fi
-
-        {
-          echo "version=${version}"
-          echo "tag=${REF_NAME}"
-        } >> "$GITHUB_OUTPUT"
-
-    - name: Stamp the plugin header and readme
-      id: stamp
-      if: ${{ steps.resolve.outputs.skip != 'true' }}
-      shell: bash
-      env:
-        VERSION: ${{ steps.resolve.outputs.version }}
-        PLUGIN_FILE_INPUT: ${{ inputs.plugin_file }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: |
         # The header pattern tolerates the docblock forms WordPress accepts:
         # "Version: x", " * Version: x", "*Version: x".
         header_re='^[[:space:]]*\*?[[:space:]]*Version:'
+
+        # Git Updater compares with PHP's version_compare, so use it when PHP is
+        # present - it orders 1.0.0-beta1 before 1.0.0, where sort -V does not.
+        version_lt() {
+          if command -v php >/dev/null 2>&1; then
+            A="$1" B="$2" php -r 'exit(version_compare(getenv("A"), getenv("B"), "<") ? 0 : 1);'
+          else
+            [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+          fi
+        }
+
+        tag="$VERSION_INPUT"
+        if [ -z "$tag" ]; then
+          echo "::error::The version input is required. Pass it from a workflow_dispatch input."
+          exit 1
+        fi
+
+        version="${tag#v}"
+        case "$version" in
+          [0-9]*.[0-9]*) ;;
+          *)
+            echo "::error::'${tag}' is not version-shaped. Expected something like 1.2.0 or v1.2.0."
+            exit 1
+            ;;
+        esac
 
         if [ -n "$PLUGIN_FILE_INPUT" ]; then
           plugin_file="$PLUGIN_FILE_INPUT"
@@ -153,18 +156,63 @@ runs:
           fi
           plugin_file="${candidates[0]}"
         fi
-
         echo "plugin file: ${plugin_file}"
+
+        # Git Updater only reads the version from the primary branch, so a
+        # release cut from anywhere else would never be offered.
+        primary="$({ grep -m1 -E '^[[:space:]]*\*?[[:space:]]*Primary Branch:' "$plugin_file" || true; } \
+          | sed -E 's|^[[:space:]]*\*?[[:space:]]*Primary Branch:[[:space:]]*||' \
+          | tr -d '[:space:]')"
+        primary="${primary:-$DEFAULT_BRANCH}"
+        if [ "$REF_TYPE" != "branch" ] || [ "$REF_NAME" != "$primary" ]; then
+          echo "::error::Run this from the primary branch '${primary}' (this run is on ${REF_TYPE} '${REF_NAME}'). Git Updater reads the version from '${primary}', so a release made anywhere else is never offered."
+          exit 1
+        fi
 
         if ! grep -qE "$header_re" "$plugin_file"; then
           echo "::error::'${plugin_file}' has no 'Version:' header. Git Updater requires one to compare versions - add 'Version: 0.0.0' to the plugin header block."
           exit 1
         fi
-
         current="$(grep -m1 -E "$header_re" "$plugin_file" \
           | sed -E 's|^[[:space:]]*\*?[[:space:]]*Version:[[:space:]]*||' \
           | tr -d '[:space:]')"
-        echo "header version: '${current}' -> '${VERSION}'"
+        if [ -n "$current" ] && version_lt "$version" "$current"; then
+          echo "::error::'${primary}' already has version ${current}, higher than ${version}. Git Updater only offers a higher version - pick a version above ${current}."
+          exit 1
+        fi
+
+        if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+          echo "::error::Tag '${tag}' already exists. Release tags are never moved - pick a new version."
+          exit 1
+        fi
+
+        # Exit 2 means "no such ref"; anything else non-zero is a failed query.
+        rc=0
+        git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null || rc=$?
+        case "$rc" in
+          0) echo "::error::Tag '${tag}' already exists on origin. Release tags are never moved - pick a new version."; exit 1 ;;
+          2) ;;
+          *) echo "::error::Could not query origin for existing tags (git ls-remote exit ${rc})."; exit 1 ;;
+        esac
+
+        echo "Releasing version '${version}' (currently '${current}') as tag '${tag}' on '${primary}'."
+        {
+          echo "version=${version}"
+          echo "tag=${tag}"
+          echo "branch=${primary}"
+          echo "plugin_file=${plugin_file}"
+          echo "current=${current}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Stamp the plugin header and readme
+      id: stamp
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+        CURRENT: ${{ steps.resolve.outputs.current }}
+        PLUGIN_FILE: ${{ steps.resolve.outputs.plugin_file }}
+      run: |
+        header_re='^[[:space:]]*\*?[[:space:]]*Version:'
 
         # readme.txt is lowercase on wordpress.org, but accept either casing.
         readme=""
@@ -175,13 +223,12 @@ runs:
           fi
         done
 
-        readme_needs_work=false
         if [ -n "$readme" ]; then
           if grep -qE '^Stable tag:' "$readme"; then
             readme_current="$(grep -m1 -E '^Stable tag:' "$readme" \
               | sed -E 's|^Stable tag:[[:space:]]*||' | tr -d '[:space:]')"
             echo "readme '${readme}' stable tag: '${readme_current}' -> '${VERSION}'"
-            [ "$readme_current" = "$VERSION" ] || readme_needs_work=true
+            [ "$readme_current" != "$VERSION" ] || readme=""
           else
             echo "readme '${readme}' has no 'Stable tag:' line - leaving it alone."
             readme=""
@@ -189,15 +236,13 @@ runs:
         else
           echo "no tracked readme.txt - only the plugin header will be stamped."
         fi
+        echo "header version: '${CURRENT}' -> '${VERSION}'"
 
-        # Idempotency. A push made with GITHUB_TOKEN does not re-trigger
-        # workflows, so the tag move cannot loop on its own; this guard keeps
-        # that true when a PAT is used instead, where that protection is gone.
-        if [ "$current" = "$VERSION" ] && [ "$readme_needs_work" = false ]; then
-          echo "Version '${VERSION}' is already in place - nothing to do."
+        # Bumped on the branch before running: tag the checked-out commit as is.
+        if [ "$CURRENT" = "$VERSION" ] && [ -z "$readme" ]; then
+          echo "Version '${VERSION}' is already in place - tagging the checked-out commit without a packaging commit."
           {
             echo "stamped=false"
-            echo "plugin_file=${plugin_file}"
             echo "readme_updated=false"
           } >> "$GITHUB_OUTPUT"
           exit 0
@@ -214,7 +259,7 @@ runs:
         # also keeps it out of the script text.
         VERSION="$VERSION" perl -pi -e '
           if (!$seen && s/^(\s*\*?\s*Version:\s*).*$/${1}$ENV{VERSION}/) { $seen = 1 }
-        ' "$plugin_file"
+        ' "$PLUGIN_FILE"
 
         readme_updated=false
         if [ -n "$readme" ]; then
@@ -224,8 +269,8 @@ runs:
           readme_updated=true
         fi
 
-        echo "::group::${plugin_file} header"
-        grep -m1 -E "$header_re" "$plugin_file"
+        echo "::group::${PLUGIN_FILE} header"
+        grep -m1 -E "$header_re" "$PLUGIN_FILE"
         echo "::endgroup::"
         if [ "$readme_updated" = true ]; then
           echo "::group::${readme} stable tag"
@@ -235,25 +280,23 @@ runs:
 
         {
           echo "stamped=true"
-          echo "plugin_file=${plugin_file}"
           echo "readme_updated=${readme_updated}"
           echo "readme=${readme}"
         } >> "$GITHUB_OUTPUT"
 
     - name: Commit the packaging change
-      id: commit
       if: ${{ steps.stamp.outputs.stamped == 'true' }}
       shell: bash
       env:
         ACTOR: ${{ github.actor }}
         ACTOR_ID: ${{ github.actor_id }}
         VERSION: ${{ steps.resolve.outputs.version }}
-        PLUGIN_FILE: ${{ steps.stamp.outputs.plugin_file }}
+        PLUGIN_FILE: ${{ steps.resolve.outputs.plugin_file }}
         README: ${{ steps.stamp.outputs.readme }}
       run: |
         # The <id>+<login>@users.noreply.github.com form links the commit back
         # to a GitHub profile, so the packaging commit is attributed to whoever
-        # pushed the tag.
+        # ran the release.
         git config user.name "$ACTOR"
         git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
 
@@ -271,63 +314,77 @@ runs:
         git commit -m "Set version ${VERSION} for release"
         git --no-pager log -1 --format='committed %h by %an <%ae>'
 
+    - name: Tag the release commit
+      id: tag
+      shell: bash
+      env:
+        TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        git tag "$TAG"
         echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "Tagged $(git rev-parse --short HEAD) as '${TAG}'."
 
-    - name: Move the tag onto the packaging commit
-      if: ${{ steps.stamp.outputs.stamped == 'true' && contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
+    - name: Push the branch and the tag
+      if: ${{ contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
       shell: bash
       env:
         TOKEN: ${{ inputs.token || github.token }}
         REPO: ${{ github.repository }}
+        BRANCH: ${{ steps.resolve.outputs.branch }}
         TAG: ${{ steps.resolve.outputs.tag }}
       run: |
-        # Set the remote explicitly so the chosen token is what authenticates
-        # the push, rather than whatever credentials actions/checkout persisted.
+        # Set the remote explicitly so the chosen token authenticates the push,
+        # rather than whatever credentials actions/checkout persisted.
         git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 
-        # The commit that was originally tagged stays reachable through its
-        # branch, so anything pinning it is never orphaned.
-        git tag -f "$TAG"
-        git push --force origin "refs/tags/${TAG}"
+        # Atomic, so the branch and the tag land together or not at all. No
+        # --force: the branch only fast-forwards and the tag is never replaced.
+        if ! output="$(git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}" 2>&1)"; then
+          echo "$output"
+          if printf '%s\n' "$output" | grep -qF '(already exists)'; then
+            echo "::error::Tag '${TAG}' was created on origin while this ran. Nothing was pushed - pick a new version."
+          elif printf '%s\n' "$output" | grep -qE '\((fetch first|non-fast-forward)\)'; then
+            echo "::error::'${BRANCH}' moved while this ran, so nothing was pushed. Re-run the workflow."
+          else
+            echo "::error::Pushing to '${BRANCH}' was refused, so nothing was pushed - the branch is probably protected. GITHUB_TOKEN cannot bypass a ruleset, so pass a token from an actor on the bypass list for '${BRANCH}' (a GitHub App installation token, or a PAT of a user whose role can bypass) via the 'token' input. The workflow also needs 'permissions: contents: write'."
+          fi
+          exit 1
+        fi
+        echo "$output"
 
-        echo "Tag '${TAG}' now points at $(git rev-parse HEAD)."
+        echo "Pushed '${BRANCH}' and tag '${TAG}' at $(git rev-parse --short HEAD)."
 
     - name: Summary
       shell: bash
       env:
         STAMPED: ${{ steps.stamp.outputs.stamped }}
         VERSION: ${{ steps.resolve.outputs.version }}
-        PLUGIN_FILE: ${{ steps.stamp.outputs.plugin_file }}
+        PLUGIN_FILE: ${{ steps.resolve.outputs.plugin_file }}
         README_UPDATED: ${{ steps.stamp.outputs.readme_updated }}
         README: ${{ steps.stamp.outputs.readme }}
-        COMMIT: ${{ steps.commit.outputs.commit }}
+        COMMIT: ${{ steps.tag.outputs.commit }}
         TAG: ${{ steps.resolve.outputs.tag }}
+        BRANCH: ${{ steps.resolve.outputs.branch }}
         DRY_RUN: ${{ inputs.dry_run }}
       run: |
         {
           echo "### WordPress plugin version"
           echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Version | \`${VERSION}\` |"
+          echo "| Tag | \`${TAG}\` |"
+          echo "| Branch | \`${BRANCH}\` |"
+          echo "| Commit | \`${COMMIT}\` |"
+          echo "| Plugin header | \`${PLUGIN_FILE}\` |"
+          if [ "$README_UPDATED" = "true" ]; then
+            echo "| Stable tag | \`${README}\` |"
+          fi
+          if [ -n "$DRY_RUN" ] && ! printf '%s' "$DRY_RUN" | grep -qiE '^(false|0|no|off)$'; then
+            echo "| Pushed | _skipped (dry run)_ |"
+          fi
+          echo ""
           if [ "$STAMPED" != "true" ]; then
-            if [ -z "$VERSION" ]; then
-              echo "Tag \`${TAG}\` is not version-shaped - nothing stamped."
-            else
-              echo "Version \`${VERSION}\` was already in place - nothing to do."
-            fi
-          else
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Version | \`${VERSION}\` |"
-            echo "| Plugin header | \`${PLUGIN_FILE}\` |"
-            if [ "$README_UPDATED" = "true" ]; then
-              echo "| Stable tag | \`${README}\` |"
-            else
-              echo "| Stable tag | _no readme.txt Stable tag to update_ |"
-            fi
-            echo "| Tag | \`${TAG}\` |"
-            if [ -n "$DRY_RUN" ] && ! printf '%s' "$DRY_RUN" | grep -qiE '^(false|0|no|off)$'; then
-              echo "| Tag moved | _skipped (dry run)_ |"
-            else
-              echo "| Tag now at | \`${COMMIT}\` |"
-            fi
+            echo "Version was already on the branch - tagged the checked-out commit without a packaging commit."
           fi
         } >> "$GITHUB_STEP_SUMMARY"

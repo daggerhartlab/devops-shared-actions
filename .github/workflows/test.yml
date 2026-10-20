@@ -442,6 +442,10 @@ jobs:
   wp-plugin-version:
     name: WP plugin version
     runs-on: ubuntu-latest
+    env:
+      # The action refuses to run anywhere but the plugin's primary branch, so
+      # the fixtures name whatever ref this run is on as theirs.
+      FIXTURE_BRANCH: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -456,11 +460,12 @@ jobs:
       # files are committed because discovery reads tracked files only.
       - name: Build a WordPress plugin fixture
         run: |
-          cat > wpfix-plugin.php <<'PHP'
+          cat > wpfix-plugin.php <<PHP
           <?php
           /**
            * Plugin Name: WP Fixture
            * Version: 0.1.0
+           * Primary Branch: ${FIXTURE_BRANCH}
            */
 
           // Changelog reference that must survive untouched:
@@ -496,6 +501,8 @@ jobs:
         env:
           STAMPED: ${{ steps.stamp.outputs.stamped }}
           VERSION: ${{ steps.stamp.outputs.version }}
+          TAG: ${{ steps.stamp.outputs.tag }}
+          BRANCH: ${{ steps.stamp.outputs.branch }}
           PLUGIN_FILE: ${{ steps.stamp.outputs.plugin_file }}
           README_UPDATED: ${{ steps.stamp.outputs.readme_updated }}
           COMMIT: ${{ steps.stamp.outputs.commit }}
@@ -503,8 +510,14 @@ jobs:
           fail=0
           [ "$STAMPED" = "true" ]              || { echo "::error::expected stamped=true, got '$STAMPED'"; fail=1; }
           [ "$VERSION" = "9.9.9" ]             || { echo "::error::expected version=9.9.9, got '$VERSION'"; fail=1; }
+          [ "$TAG" = "9.9.9" ]                 || { echo "::error::expected tag=9.9.9, got '$TAG'"; fail=1; }
+          [ "$BRANCH" = "$FIXTURE_BRANCH" ]    || { echo "::error::expected branch=$FIXTURE_BRANCH, got '$BRANCH'"; fail=1; }
           [ "$README_UPDATED" = "true" ]       || { echo "::error::expected readme_updated=true, got '$README_UPDATED'"; fail=1; }
-          [ -n "$COMMIT" ]                     || { echo "::error::commit is empty - the packaging commit should be made even on a dry run"; fail=1; }
+
+          # The tag is created locally on the packaging commit even on a dry run.
+          [ "$COMMIT" = "$(git rev-parse HEAD)" ]            || { echo "::error::commit output is not HEAD"; fail=1; }
+          [ "$(git rev-parse 'refs/tags/9.9.9^{commit}')" = "$COMMIT" ] || { echo "::error::tag 9.9.9 is not on the packaging commit"; fail=1; }
+          [ "$(git log -1 --format=%s)" = "Set version 9.9.9 for release" ] || { echo "::error::HEAD is not the packaging commit"; fail=1; }
 
           # Discovery must pick the root entry file, not the vendored decoy.
           [ "$PLUGIN_FILE" = "wpfix-plugin.php" ] || { echo "::error::expected plugin_file=wpfix-plugin.php, got '$PLUGIN_FILE'"; fail=1; }
@@ -524,34 +537,86 @@ jobs:
           echo "committed as: $(git --no-pager log -1 --format='%an <%ae>')"
           exit "$fail"
 
-      - name: Run wp-plugin-version (idempotent no-op path)
-        id: noop
+      # Release tags are never moved, so an existing one must be refused.
+      - name: Run wp-plugin-version with an existing tag
+        id: existing
+        continue-on-error: true
         uses: ./.github/actions/wp-plugin-version
         with:
           version: '9.9.9'
           dry_run: 'true'
 
-      - name: Assert the no-op path
+      # Bumped on the branch before running: the version is already there, so
+      # the checked-out commit is tagged without a packaging commit.
+      - name: Drop the dry-run tag
+        run: git tag -d 9.9.9
+
+      - name: Run wp-plugin-version (already bumped)
+        id: bumped
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.9'
+          dry_run: 'true'
+
+      - name: Run wp-plugin-version with a lower version
+        id: lower
+        continue-on-error: true
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.1'
+          dry_run: 'true'
+
+      - name: Assert the existing-tag, already-bumped and lower-version paths
         env:
-          STAMPED: ${{ steps.noop.outputs.stamped }}
-          COMMIT: ${{ steps.noop.outputs.commit }}
+          EXISTING: ${{ steps.existing.outcome }}
+          STAMPED: ${{ steps.bumped.outputs.stamped }}
+          COMMIT: ${{ steps.bumped.outputs.commit }}
+          PACKAGING: ${{ steps.stamp.outputs.commit }}
+          LOWER: ${{ steps.lower.outcome }}
         run: |
           fail=0
-          [ "$STAMPED" = "false" ] || { echo "::error::expected stamped=false on a re-run, got '$STAMPED'"; fail=1; }
-          [ -z "$COMMIT" ]         || { echo "::error::no-op still produced a commit: $COMMIT"; fail=1; }
-          echo "no-op path clean"
+          [ "$EXISTING" = "failure" ]   || { echo "::error::expected an existing tag to be refused, got '$EXISTING'"; fail=1; }
+          [ "$STAMPED" = "false" ]      || { echo "::error::expected stamped=false when already bumped, got '$STAMPED'"; fail=1; }
+          [ "$COMMIT" = "$PACKAGING" ]  || { echo "::error::already-bumped run should tag the checked-out commit, got '$COMMIT'"; fail=1; }
+          [ "$LOWER" = "failure" ]      || { echo "::error::expected a lower version to be refused, got '$LOWER'"; fail=1; }
+          git rev-parse -q --verify refs/tags/9.9.1 >/dev/null && { echo "::error::refused run still created tag 9.9.1"; fail=1; }
           exit "$fail"
+
+      # Git Updater only reads the primary branch, so running anywhere else is
+      # refused rather than producing a release that is never offered.
+      - name: Name a different primary branch
+        run: |
+          V=not-this-branch perl -pi -e 's/^( \* Primary Branch: ).*/${1}$ENV{V}/' wpfix-plugin.php
+          git commit -q -am 'Point the primary branch elsewhere'
+
+      - name: Run wp-plugin-version off the primary branch
+        id: offbranch
+        continue-on-error: true
+        uses: ./.github/actions/wp-plugin-version
+        with:
+          version: '9.9.10'
+          dry_run: 'true'
+
+      - name: Assert the primary branch guard fired
+        env:
+          OUTCOME: ${{ steps.offbranch.outcome }}
+        run: |
+          [ "$OUTCOME" = "failure" ] \
+            || { echo "::error::expected failure off the primary branch, got '$OUTCOME'"; exit 1; }
+          git checkout -q HEAD~1
+          echo "primary branch guard fired as expected"
 
       # Two root-level entry files is malformed, and guessing between them would
       # stamp the wrong plugin. The action must refuse and name the input that
       # resolves it.
       - name: Add a second root-level plugin file
         run: |
-          cat > second-plugin.php <<'PHP'
+          cat > second-plugin.php <<PHP
           <?php
           /**
            * Plugin Name: Second Fixture
            * Version: 0.0.1
+           * Primary Branch: ${FIXTURE_BRANCH}
            */
           PHP
           git add second-plugin.php
