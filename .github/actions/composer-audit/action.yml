@@ -1,0 +1,58 @@
+name: "Composer Audit"
+description: "Runs composer audit against composer.lock and writes any security advisories to the job summary, one row per package with the version that fixes them."
+
+# Requires PHP and Composer on PATH - run setup-runner with php_version set
+# first. Audits composer.lock directly, so no composer install is needed.
+#
+# Finding advisories is a successful run: the summary is the deliverable. The
+# step fails only when the audit itself could not run. Abandoned packages and
+# advisories listed under audit.ignore are never reported.
+inputs:
+  working_directory:
+    description: 'Directory holding composer.json and composer.lock, relative to the repo.'
+    required: false
+    default: '.'
+  no_dev:
+    description: "Audit production packages only. Pass 'false'/'0'/'no'/'off' to include require-dev packages."
+    required: false
+    default: 'true'
+
+outputs:
+  advisory_count:
+    description: 'Number of security advisories found.'
+    value: ${{ steps.audit.outputs.advisory_count }}
+  package_count:
+    description: 'Number of packages with at least one advisory.'
+    value: ${{ steps.audit.outputs.package_count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Audit and summarize
+      id: audit
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        NO_DEV: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.no_dev) }}
+      run: |
+        if ! command -v composer >/dev/null 2>&1; then
+          echo "::error::composer not found on PATH. Run setup-runner with php_version set before this action."
+          exit 1
+        fi
+        if [ ! -f composer.lock ]; then
+          echo "::error::No composer.lock in '$(pwd)'. Set working_directory to the directory that holds it."
+          exit 1
+        fi
+
+        args=(audit --locked --format=json --abandoned=ignore --no-interaction)
+        if [ "$NO_DEV" = "true" ]; then
+          args+=(--no-dev)
+        fi
+
+        report="$RUNNER_TEMP/composer-audit.json"
+        set +e
+        composer "${args[@]}" > "$report"
+        code=$?
+        set -e
+
+        php "$GITHUB_ACTION_PATH/summarize.php" "$report" composer.lock "$code"

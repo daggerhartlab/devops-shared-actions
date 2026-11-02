@@ -659,3 +659,125 @@ jobs:
           # The first plugin must be left at the earlier version.
           grep -qxF " * Version: 9.9.9" wpfix-plugin.php   || { echo "::error::wpfix-plugin.php was stamped when plugin_file named another file"; fail=1; }
           exit "$fail"
+
+  composer-audit:
+    name: Composer audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: '8.3'
+
+      # Hand-written locks: --locked audits composer.lock alone, so nothing is
+      # installed. Old releases stay vulnerable, so these keep reporting.
+      - name: Build fixtures
+        run: |
+          mkdir -p auditfix cleanfix nolockfix
+          cat > auditfix/composer.json <<'EOF'
+          { "name": "fixture/audit", "version": "1.0.0" }
+          EOF
+          cat > auditfix/composer.lock <<'EOF'
+          {
+            "packages": [{ "name": "symfony/http-kernel", "version": "v4.4.0", "type": "library" }],
+            "packages-dev": [{ "name": "phpunit/phpunit", "version": "5.0.0", "type": "library" }]
+          }
+          EOF
+          cat > cleanfix/composer.json <<'EOF'
+          { "name": "fixture/clean", "version": "1.0.0" }
+          EOF
+          cat > cleanfix/composer.lock <<'EOF'
+          { "packages": [{ "name": "psr/log", "version": "3.0.2", "type": "library" }], "packages-dev": [] }
+          EOF
+          cp cleanfix/composer.json nolockfix/
+
+      - name: Run composer-audit (production only)
+        id: prod
+        uses: ./.github/actions/composer-audit
+        with:
+          working_directory: auditfix
+
+      - name: Run composer-audit (including dev)
+        id: dev
+        uses: ./.github/actions/composer-audit
+        with:
+          working_directory: auditfix
+          no_dev: 'false'
+
+      - name: Run composer-audit (clean)
+        id: clean
+        uses: ./.github/actions/composer-audit
+        with:
+          working_directory: cleanfix
+
+      - name: Run composer-audit (no lock file)
+        id: nolock
+        continue-on-error: true
+        uses: ./.github/actions/composer-audit
+        with:
+          working_directory: nolockfix
+
+      - name: Assert audit results
+        env:
+          PROD_PACKAGES: ${{ steps.prod.outputs.package_count }}
+          PROD_ADVISORIES: ${{ steps.prod.outputs.advisory_count }}
+          DEV_PACKAGES: ${{ steps.dev.outputs.package_count }}
+          CLEAN_ADVISORIES: ${{ steps.clean.outputs.advisory_count }}
+          NOLOCK_OUTCOME: ${{ steps.nolock.outcome }}
+        run: |
+          fail=0
+          [ "$PROD_PACKAGES" = "1" ]   || { echo "::error::expected 1 production package, got '$PROD_PACKAGES'"; fail=1; }
+          [ "${PROD_ADVISORIES:-0}" -ge 1 ] || { echo "::error::expected advisories for symfony/http-kernel 4.4.0, got '$PROD_ADVISORIES'"; fail=1; }
+          [ "$DEV_PACKAGES" = "2" ]    || { echo "::error::no_dev=false should add phpunit, got '$DEV_PACKAGES' packages"; fail=1; }
+          [ "$CLEAN_ADVISORIES" = "0" ] || { echo "::error::clean fixture reported '$CLEAN_ADVISORIES' advisories"; fail=1; }
+          [ "$NOLOCK_OUTCOME" = "failure" ] || { echo "::error::a missing composer.lock should fail, got '$NOLOCK_OUTCOME'"; fail=1; }
+          exit "$fail"
+
+      # The Fixed-in logic against synthetic ranges, offline, so every shape
+      # seen in real reports is pinned regardless of what advisories exist.
+      - name: Assert Fixed in and summary formatting
+        run: |
+          dir=$(mktemp -d)
+          cat > "$dir/lock.json" <<'EOF'
+          {"packages":[
+            {"name":"a/drupal","version":"3.3.9"},
+            {"name":"a/chain","version":"v7.3.2"},
+            {"name":"a/lte","version":"2.10.1"},
+            {"name":"a/nofix","version":"1.2.0"},
+            {"name":"a/caret","version":"1.2.0"},
+            {"name":"a/multi","version":"3.1.0"}
+          ]}
+          EOF
+          cat > "$dir/audit.json" <<'EOF'
+          Deprecated: PHP Startup: noise printed before the report
+          {"advisories":{
+            "a/drupal":[{"advisoryId":"SA-CONTRIB-2026-1","affectedVersions":"<2.41 || >=3.0.0 <3.3.13","title":"Mod - Critical - Access bypass - SA-CONTRIB-2026-1","link":"https://example.com/sa"}],
+            "a/chain":[{"advisoryId":"X1","affectedVersions":">=7.3.0,<7.4.0|>=7.4.0,<7.4.22","title":"t"}],
+            "a/lte":[{"advisoryId":"X2","affectedVersions":">=2.0.0,<=2.10.1","title":"A | B"}],
+            "a/nofix":[{"advisoryId":"X3","affectedVersions":">=1.0","title":"t"}],
+            "a/caret":[{"advisoryId":"X4","affectedVersions":"^1.0","title":"t"}],
+            "a/multi":{"0":{"advisoryId":"X5","affectedVersions":">=3.0.0 <3.1.4","title":"t"},"2":{"advisoryId":"X6","affectedVersions":">=3.0.0 <3.2.1","title":"t"}}
+          },"abandoned":[],"filter":[]}
+          EOF
+          script=.github/actions/composer-audit/summarize.php
+          fail=0
+
+          GITHUB_STEP_SUMMARY="$dir/sum.md" GITHUB_OUTPUT="$dir/out" php "$script" "$dir/audit.json" "$dir/lock.json" 1
+          cat "$dir/sum.md"
+          expect() { grep -qF -- "$1" "$dir/sum.md" || { echo "::error::summary is missing: $1"; fail=1; }; }
+          expect '| a/drupal | 3.3.9 | 3.3.13 | [SA-CONTRIB-2026-1](https://example.com/sa): Mod - Critical - Access bypass |'
+          expect '| a/chain | 7.3.2 | 7.4.22 |'
+          expect '| a/lte | 2.10.1 | after 2.10.1 | X2: A \| B |'
+          expect '| a/nofix | 1.2.0 | No fix released |'
+          expect '| a/caret | 1.2.0 | Check advisory: `^1.0` |'
+          expect '| a/multi | 3.1.0 | 3.2.1 | X5: t<br>X6: t |'
+          grep -qxF 'advisory_count=7' "$dir/out" || { echo "::error::expected advisory_count=7"; fail=1; }
+          grep -qxF 'package_count=6' "$dir/out"  || { echo "::error::expected package_count=6"; fail=1; }
+
+          echo 'not json' > "$dir/bad.json"
+          if GITHUB_STEP_SUMMARY="$dir/bad.md" php "$script" "$dir/bad.json" "$dir/lock.json" 1; then
+            echo "::error::an unusable report should fail"; fail=1
+          fi
+          grep -qF 'Audit failed' "$dir/bad.md" || { echo "::error::failure summary missing"; fail=1; }
+          exit "$fail"

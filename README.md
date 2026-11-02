@@ -27,6 +27,9 @@ every example below uses.
 - [`wp-plugin-version`](#wp-plugin-version) — stamps a release version into a
   WordPress plugin's header and `readme.txt` Stable tag on its primary branch,
   and pushes the branch with a new release tag on that commit.
+- [`composer-audit`](#composer-audit) — runs `composer audit` against
+  `composer.lock` and writes security advisories to the job summary, one row
+  per package with the version that fixes them.
 
 All are composite actions; see each `action.yml` for the full,
 authoritative list of inputs and defaults. This README covers common usage
@@ -620,6 +623,68 @@ Outputs: `stamped`, `version`, `tag`, `branch`, `plugin_file`,
 - **No datestamp.** That is a drupal.org packaging convention with no
   WordPress equivalent.
 
+---
+
+## `composer-audit`
+
+Runs `composer audit` against `composer.lock` and writes the security
+advisories to the run's Summary page, one row per package, ready to paste
+into a ticket. Intended to be run by hand after Drupal's Wednesday security
+releases are published.
+
+```yaml
+name: Security audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+        with:
+          php_version: '8.3'
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/composer-audit@v1
+```
+
+The summary looks like this:
+
+| Package | Installed | Fixed in | Advisories |
+|---|---|---|---|
+| drupal/commerce | 3.3.9 | 3.3.13 | [SA-CONTRIB-2026-254](https://www.drupal.org/sa-contrib-2026-254): Commerce Core - Highly critical - Access bypass<br>… |
+
+A clean site gets a one-line "No security advisories". Both are green runs —
+the step fails only when the audit itself could not run.
+
+Inputs: `working_directory` (default `.`), `no_dev` (default `true`, audits
+production packages only). Outputs: `advisory_count`, `package_count`.
+
+### Gotchas
+
+- **"Fixed in" is worked out, not reported.** Composer only gives each
+  advisory's affected range. The action takes the range your installed
+  version falls in and follows it to its upper bound, through ranges that
+  touch end to end (Symfony publishes one per minor), so it is the first
+  release on your line that clears every advisory for that package. `after X`
+  means the range ends at `<=X` and names no fix; `No fix released` means it
+  has no upper bound; anything it can't parse (`^`, `~`, dev branches) shows
+  the raw range under `Check advisory`.
+- **It audits the lock file, not `vendor/`.** `--locked` means no
+  `composer install`, so it is quick — and it reports what is committed, not
+  what is deployed if the two have drifted.
+- **Abandoned packages and `audit.ignore` entries are never shown.** The
+  former is `--abandoned=ignore`; the latter is Composer's own filtering.
+- **Not just Drupal.** Any Composer dependency with a published advisory
+  appears, including libraries like `symfony/*` and `league/commonmark`.
+  Drupal's "unsupported module" status is not an advisory and does not appear.
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -636,6 +701,7 @@ once `v1` is moved onto it.
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
+| `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts `no_dev` excludes the dev package by default and includes it when off, that a clean lock reports zero, and that a missing lock fails; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable) and that an unusable report fails with a summary |
 
 Two things worth knowing if you extend this:
 
