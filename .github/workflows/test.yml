@@ -718,6 +718,26 @@ jobs:
         with:
           working_directory: nolockfix
 
+      # Several directories: one summary, totals across them, and a missing
+      # directory fails the step only after the others have reported.
+      - name: Run composer-audit (multiple directories)
+        id: multi
+        uses: ./.github/actions/composer-audit
+        with:
+          working_directory: |
+            auditfix
+
+            cleanfix/
+
+      - name: Run composer-audit (multiple, one missing)
+        id: multimissing
+        continue-on-error: true
+        uses: ./.github/actions/composer-audit
+        with:
+          working_directory: |
+            auditfix
+            nolockfix
+
       - name: Assert audit results
         env:
           PROD_PACKAGES: ${{ steps.prod.outputs.package_count }}
@@ -725,6 +745,10 @@ jobs:
           DEV_PACKAGES: ${{ steps.dev.outputs.package_count }}
           CLEAN_ADVISORIES: ${{ steps.clean.outputs.advisory_count }}
           NOLOCK_OUTCOME: ${{ steps.nolock.outcome }}
+          MULTI_PACKAGES: ${{ steps.multi.outputs.package_count }}
+          MULTI_OUTCOME: ${{ steps.multi.outcome }}
+          MISSING_PACKAGES: ${{ steps.multimissing.outputs.package_count }}
+          MISSING_OUTCOME: ${{ steps.multimissing.outcome }}
         run: |
           fail=0
           [ "$PROD_PACKAGES" = "1" ]   || { echo "::error::expected 1 production package, got '$PROD_PACKAGES'"; fail=1; }
@@ -732,6 +756,10 @@ jobs:
           [ "$DEV_PACKAGES" = "2" ]    || { echo "::error::no_dev=false should add phpunit, got '$DEV_PACKAGES' packages"; fail=1; }
           [ "$CLEAN_ADVISORIES" = "0" ] || { echo "::error::clean fixture reported '$CLEAN_ADVISORIES' advisories"; fail=1; }
           [ "$NOLOCK_OUTCOME" = "failure" ] || { echo "::error::a missing composer.lock should fail, got '$NOLOCK_OUTCOME'"; fail=1; }
+          [ "$MULTI_OUTCOME" = "success" ]  || { echo "::error::two valid directories should pass, got '$MULTI_OUTCOME'"; fail=1; }
+          [ "$MULTI_PACKAGES" = "1" ]       || { echo "::error::expected 1 package across auditfix + cleanfix, got '$MULTI_PACKAGES'"; fail=1; }
+          [ "$MISSING_OUTCOME" = "failure" ] || { echo "::error::a listed directory with no lock should fail, got '$MISSING_OUTCOME'"; fail=1; }
+          [ "$MISSING_PACKAGES" = "1" ]     || { echo "::error::auditfix should still report alongside a missing directory, got '$MISSING_PACKAGES'"; fail=1; }
           exit "$fail"
 
       # The Fixed-in logic against synthetic ranges, offline, so every shape
@@ -739,7 +767,7 @@ jobs:
       - name: Assert Fixed in and summary formatting
         run: |
           dir=$(mktemp -d)
-          cat > "$dir/lock.json" <<'EOF'
+          cat > "$dir/composer.lock" <<'EOF'
           {"packages":[
             {"name":"a/drupal","version":"3.3.9"},
             {"name":"a/chain","version":"v7.3.2"},
@@ -763,7 +791,7 @@ jobs:
           script=.github/actions/composer-audit/summarize.php
           fail=0
 
-          GITHUB_STEP_SUMMARY="$dir/sum.md" GITHUB_OUTPUT="$dir/out" php "$script" "$dir/audit.json" "$dir/lock.json" 1
+          GITHUB_STEP_SUMMARY="$dir/sum.md" GITHUB_OUTPUT="$dir/out" php "$script" "$dir" "$dir/audit.json" 1
           cat "$dir/sum.md"
           expect() { grep -qF -- "$1" "$dir/sum.md" || { echo "::error::summary is missing: $1"; fail=1; }; }
           expect '| a/drupal | 3.3.9 | 3.3.13 | [SA-CONTRIB-2026-1](https://example.com/sa): Mod - Critical - Access bypass |'
@@ -777,8 +805,31 @@ jobs:
           grep -qxF 'package_count=6' "$dir/out"  || { echo "::error::expected package_count=6"; fail=1; }
 
           echo 'not json' > "$dir/bad.json"
-          if GITHUB_STEP_SUMMARY="$dir/bad.md" php "$script" "$dir/bad.json" "$dir/lock.json" 1; then
+          if GITHUB_STEP_SUMMARY="$dir/bad.md" php "$script" "$dir" "$dir/bad.json" 1; then
             echo "::error::an unusable report should fail"; fail=1
           fi
           grep -qF 'Audit failed' "$dir/bad.md" || { echo "::error::failure summary missing"; fail=1; }
+
+          # Multiple locations: a heading each, totals up top, and a failed
+          # location reported in place while the step still fails.
+          cd "$dir"
+          echo '{"advisories":[],"abandoned":[]}' > clean.json
+          if GITHUB_STEP_SUMMARY=multi.md GITHUB_OUTPUT=multi.out php "$OLDPWD/$script" . audit.json 1 theme/ clean.json 0 gone bad.json missing; then
+            echo "::error::a missing location should fail the multi-location run"; fail=1
+          fi
+          cat multi.md
+          cd "$OLDPWD"
+          multi() { grep -qF -- "$1" "$dir/multi.md" || { echo "::error::multi summary is missing: $1"; fail=1; }; }
+          multi '6 packages, 7 advisories across 3 locations'
+          # shellcheck disable=SC2016 # literal backticks: markdown code spans
+          multi '#### `.`'
+          # shellcheck disable=SC2016
+          multi '#### `theme`'
+          # shellcheck disable=SC2016
+          multi '#### `gone`'
+          multi '| a/chain | 7.3.2 | 7.4.22 |'
+          multi 'No security advisories.'
+          # shellcheck disable=SC2016
+          multi '**Audit failed** - No `composer.lock` in this directory.'
+          grep -qxF 'package_count=6' "$dir/multi.out" || { echo "::error::multi package_count should total 6"; fail=1; }
           exit "$fail"

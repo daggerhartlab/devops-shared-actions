@@ -628,9 +628,8 @@ Outputs: `stamped`, `version`, `tag`, `branch`, `plugin_file`,
 ## `composer-audit`
 
 Runs `composer audit` against `composer.lock` and writes the security
-advisories to the run's Summary page, one row per package, ready to paste
-into a ticket. Intended to be run by hand after Drupal's Wednesday security
-releases are published.
+advisories to the run's Summary page, one row per package with the version
+that fixes them, in a form that pastes cleanly into an issue or ticket.
 
 ```yaml
 name: Security audit
@@ -658,13 +657,32 @@ The summary looks like this:
 
 | Package | Installed | Fixed in | Advisories |
 |---|---|---|---|
-| drupal/commerce | 3.3.9 | 3.3.13 | [SA-CONTRIB-2026-254](https://www.drupal.org/sa-contrib-2026-254): Commerce Core - Highly critical - Access bypass<br>… |
+| example/http-client | 2.3.1 | 2.3.4 | [ADVISORY-1](https://example.com/advisory-1): Header injection<br>[ADVISORY-2](https://example.com/advisory-2): Open redirect |
+| example/markdown | 1.8.0 | after 1.8.0 | [ADVISORY-3](https://example.com/advisory-3): Denial of service |
 
-A clean site gets a one-line "No security advisories". Both are green runs —
+A clean project gets a one-line "No security advisories". Both are green runs —
 the step fails only when the audit itself could not run.
 
 Inputs: `working_directory` (default `.`), `no_dev` (default `true`, audits
 production packages only). Outputs: `advisory_count`, `package_count`.
+
+### Several Composer directories
+
+For a project with its own `composer.lock` in a subdirectory, such as a
+theme or plugin, as well as the root, list each directory on its own line:
+
+```yaml
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/composer-audit@v1
+        with:
+          working_directory: |
+            .
+            web/themes/custom/example
+```
+
+It is still one summary: the counts are totalled at the top, and each
+directory gets its own heading with its table, or "No security advisories". A
+listed directory with no `composer.lock`, or whose audit fails, shows **Audit
+failed** under its heading; the others still report and the step then fails.
 
 ### Gotchas
 
@@ -681,9 +699,11 @@ production packages only). Outputs: `advisory_count`, `package_count`.
   what is deployed if the two have drifted.
 - **Abandoned packages and `audit.ignore` entries are never shown.** The
   former is `--abandoned=ignore`; the latter is Composer's own filtering.
-- **Not just Drupal.** Any Composer dependency with a published advisory
-  appears, including libraries like `symfony/*` and `league/commonmark`.
-  Drupal's "unsupported module" status is not an advisory and does not appear.
+- **Only published advisories are reported.** Anything a package registry
+  flags in other ways, such as a release marked unsupported, is not an
+  advisory and does not appear. Advisories come from the sources Composer
+  queries: Packagist (which aggregates the GitHub and FriendsOfPHP databases)
+  and any repository that publishes its own, such as packages.drupal.org.
 
 ## Testing
 
@@ -701,7 +721,7 @@ once `v1` is moved onto it.
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
-| `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts `no_dev` excludes the dev package by default and includes it when off, that a clean lock reports zero, and that a missing lock fails; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable) and that an unusable report fails with a summary |
+| `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts `no_dev` excludes the dev package by default and includes it when off, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
 
 Two things worth knowing if you extend this:
 

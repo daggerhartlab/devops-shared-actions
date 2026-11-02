@@ -4,90 +4,137 @@
  * @file
  * Turns `composer audit --format=json` output into a job summary.
  *
- * Usage: php summarize.php <audit-output> <composer.lock> <audit-exit-code>
+ * Usage: php summarize.php <dir> <audit-output> <exit-code> [<dir> ...]
  *
- * Writes the summary to $GITHUB_STEP_SUMMARY and advisory_count /
- * package_count to $GITHUB_OUTPUT. Exits non-zero only when the audit itself
- * could not run; finding advisories is a successful run.
+ * One triple per audited directory; exit-code "missing" means the directory
+ * has no composer.lock. Writes the summary to $GITHUB_STEP_SUMMARY and the
+ * advisory_count / package_count totals to $GITHUB_OUTPUT. Exits non-zero
+ * only when an audit could not run; finding advisories is a successful run.
  */
 
-$report_file = $argv[1] ?? '';
-$lock_file = $argv[2] ?? '';
-$exit_code = (int) ($argv[3] ?? 0);
-
-$raw = (string) @file_get_contents($report_file);
-// --abandoned=ignore leaves 0 (clean) and 1 (vulnerable) as the only results.
-// Composer also uses 1 for general errors, so a usable report is the real test.
-// A lock with no packages to audit exits 0 with nothing on stdout.
-if ($exit_code === 0 && trim($raw) === '') {
-  $audit = ['advisories' => []];
-}
-else {
-  $audit = $exit_code > 1 ? NULL : parse_report($raw);
-}
-if ($audit === NULL) {
-  echo "composer audit output:\n" . $raw . "\n";
-  echo "::error::composer audit did not produce a usable report (exit code {$exit_code}). See its output above.\n";
-  write_summary(header_line() . "\n\n**Audit failed** - composer audit did not produce a report. See the job log.\n");
-  exit(1);
-}
-
-$installed = installed_versions($lock_file);
-
-$rows = [];
-$advisory_count = 0;
-$packages = $audit['advisories'];
-ksort($packages);
-foreach ($packages as $package => $advisories) {
-  // Composer emits an object here instead of a list when it filtered entries.
-  $advisories = array_values((array) $advisories);
-  if (!$advisories) {
-    continue;
+$locations = [];
+foreach (array_chunk(array_slice($argv, 1), 3) as $chunk) {
+  if (count($chunk) === 3) {
+    $locations[] = audit_location(...$chunk);
   }
-  $advisory_count += count($advisories);
-  $version = $installed[$package] ?? '';
-
-  $fixes = [];
-  $lines = [];
-  foreach ($advisories as $advisory) {
-    $fixes[] = fixed_in($version, (string) ($advisory['affectedVersions'] ?? ''));
-    $lines[] = advisory_line($advisory);
-  }
-  $fixed = combine_fixes($fixes);
-
-  $rows[] = [
-    'package' => $package,
-    'installed' => $version === '' ? 'unknown' : ltrim($version, 'vV'),
-    'fixed' => $fixed,
-    'lines' => $lines,
-  ];
-  echo sprintf("%s %s -> %s (%d %s)\n", $package, $version ?: '?', html_entity_decode(str_replace(['`', '<br>', '\\|'], ['', ', ', '|'], $fixed)), count($advisories), count($advisories) === 1 ? 'advisory' : 'advisories');
 }
 
-$package_count = count($rows);
+$multiple = count($locations) > 1;
+$advisory_count = array_sum(array_column($locations, 'advisory_count'));
+$package_count = array_sum(array_map(fn($l) => count($l['rows']), $locations));
+$failed = array_filter($locations, fn($l) => $l['failed'] !== NULL);
 write_output('advisory_count', (string) $advisory_count);
 write_output('package_count', (string) $package_count);
 
-if (!$rows) {
-  echo "No security advisories.\n";
-  write_summary(header_line() . "\n\nNo security advisories.\n");
-  exit(0);
-}
-
 $md = header_line() . "\n\n";
-$md .= sprintf("%d %s, %d %s\n\n",
-  $package_count, $package_count === 1 ? 'package' : 'packages',
-  $advisory_count, $advisory_count === 1 ? 'advisory' : 'advisories');
-$md .= "| Package | Installed | Fixed in | Advisories |\n";
-$md .= "|---|---|---|---|\n";
-foreach ($rows as $row) {
-  $md .= sprintf("| %s | %s | %s | %s |\n",
-    cell($row['package']),
-    cell($row['installed']),
-    $row['fixed'],
-    implode('<br>', $row['lines']));
+if ($multiple) {
+  $md .= counts($package_count, $advisory_count) . ' across ' . count($locations) . " locations\n\n";
+  foreach ($locations as $location) {
+    $md .= '#### `' . $location['dir'] . "`\n\n" . location_body($location, FALSE);
+  }
+}
+else {
+  $md .= location_body($locations[0], TRUE);
 }
 write_summary($md);
+exit($failed ? 1 : 0);
+
+/**
+ * Audits one directory's report into rows.
+ *
+ * @return array
+ *   ['dir', 'failed' => NULL|message, 'rows', 'advisory_count']
+ */
+function audit_location(string $dir, string $report_file, string $exit_code): array {
+  $dir = $dir === '.' ? '.' : rtrim($dir, '/');
+  $location = ['dir' => $dir, 'failed' => NULL, 'rows' => [], 'advisory_count' => 0];
+  echo "== {$dir} ==\n";
+
+  if ($exit_code === 'missing') {
+    $location['failed'] = 'No `composer.lock` in this directory.';
+    return $location;
+  }
+
+  $code = (int) $exit_code;
+  $raw = (string) @file_get_contents($report_file);
+  // --abandoned=ignore leaves 0 (clean) and 1 (vulnerable) as the only results.
+  // Composer also uses 1 for general errors, so a usable report is the real test.
+  // A lock with no packages to audit exits 0 with nothing on stdout.
+  if ($code === 0 && trim($raw) === '') {
+    $audit = ['advisories' => []];
+  }
+  else {
+    $audit = $code > 1 ? NULL : parse_report($raw);
+  }
+  if ($audit === NULL) {
+    echo "composer audit output:\n" . $raw . "\n";
+    echo "::error::composer audit in '{$dir}' did not produce a usable report (exit code {$code}). See its output above.\n";
+    $location['failed'] = 'composer audit did not produce a report. See the job log.';
+    return $location;
+  }
+
+  $installed = installed_versions($dir . '/composer.lock');
+  $packages = $audit['advisories'];
+  ksort($packages);
+  foreach ($packages as $package => $advisories) {
+    // Composer emits an object here instead of a list when it filtered entries.
+    $advisories = array_values((array) $advisories);
+    if (!$advisories) {
+      continue;
+    }
+    $location['advisory_count'] += count($advisories);
+    $version = $installed[$package] ?? '';
+
+    $fixes = [];
+    $lines = [];
+    foreach ($advisories as $advisory) {
+      $fixes[] = fixed_in($version, (string) ($advisory['affectedVersions'] ?? ''));
+      $lines[] = advisory_line($advisory);
+    }
+    $fixed = combine_fixes($fixes);
+
+    $location['rows'][] = [
+      'package' => $package,
+      'installed' => $version === '' ? 'unknown' : ltrim($version, 'vV'),
+      'fixed' => $fixed,
+      'lines' => $lines,
+    ];
+    echo sprintf("%s %s -> %s (%d %s)\n", $package, $version ?: '?', html_entity_decode(str_replace(['`', '<br>', '\\|'], ['', ', ', '|'], $fixed)), count($advisories), count($advisories) === 1 ? 'advisory' : 'advisories');
+  }
+  if (!$location['rows']) {
+    echo "No security advisories.\n";
+  }
+  return $location;
+}
+
+/**
+ * Markdown for one location: failure, clean line, or table.
+ */
+function location_body(array $location, bool $with_counts): string {
+  if ($location['failed'] !== NULL) {
+    return '**Audit failed** - ' . $location['failed'] . "\n\n";
+  }
+  if (!$location['rows']) {
+    return "No security advisories.\n\n";
+  }
+  $md = $with_counts ? counts(count($location['rows']), $location['advisory_count']) . "\n\n" : '';
+  $md .= "| Package | Installed | Fixed in | Advisories |\n";
+  $md .= "|---|---|---|---|\n";
+  foreach ($location['rows'] as $row) {
+    $md .= sprintf("| %s | %s | %s | %s |\n",
+      cell($row['package']),
+      cell($row['installed']),
+      $row['fixed'],
+      implode('<br>', $row['lines']));
+  }
+  return $md . "\n";
+}
+
+function counts(int $packages, int $advisories): string {
+  return sprintf('%d %s, %d %s',
+    $packages, $packages === 1 ? 'package' : 'packages',
+    $advisories, $advisories === 1 ? 'advisory' : 'advisories');
+}
 
 /**
  * Extracts the JSON report, tolerating PHP notices printed around it.

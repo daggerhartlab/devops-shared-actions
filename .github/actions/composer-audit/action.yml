@@ -9,7 +9,7 @@ description: "Runs composer audit against composer.lock and writes any security 
 # advisories listed under audit.ignore are never reported.
 inputs:
   working_directory:
-    description: 'Directory holding composer.json and composer.lock, relative to the repo.'
+    description: 'Directory holding composer.json and composer.lock, relative to the repo. For several, put one per line; each is audited and reported under its own heading.'
     required: false
     default: '.'
   no_dev:
@@ -19,10 +19,10 @@ inputs:
 
 outputs:
   advisory_count:
-    description: 'Number of security advisories found.'
+    description: 'Number of security advisories found, across all directories.'
     value: ${{ steps.audit.outputs.advisory_count }}
   package_count:
-    description: 'Number of packages with at least one advisory.'
+    description: 'Number of packages with at least one advisory, across all directories.'
     value: ${{ steps.audit.outputs.package_count }}
 
 runs:
@@ -31,28 +31,50 @@ runs:
     - name: Audit and summarize
       id: audit
       shell: bash
-      working-directory: ${{ inputs.working_directory }}
       env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
         NO_DEV: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.no_dev) }}
       run: |
         if ! command -v composer >/dev/null 2>&1; then
           echo "::error::composer not found on PATH. Run setup-runner with php_version set before this action."
           exit 1
         fi
-        if [ ! -f composer.lock ]; then
-          echo "::error::No composer.lock in '$(pwd)'. Set working_directory to the directory that holds it."
-          exit 1
+
+        dirs=()
+        while IFS= read -r dir; do
+          dir="${dir#"${dir%%[![:space:]]*}"}"
+          dir="${dir%"${dir##*[![:space:]]}"}"
+          if [ -n "$dir" ]; then
+            dirs+=("$dir")
+          fi
+        done <<< "$WORKING_DIRECTORY"
+        if [ "${#dirs[@]}" -eq 0 ]; then
+          dirs=(.)
         fi
 
-        args=(audit --locked --format=json --abandoned=ignore --no-interaction)
+        audit=(audit --locked --format=json --abandoned=ignore --no-interaction)
         if [ "$NO_DEV" = "true" ]; then
-          args+=(--no-dev)
+          audit+=(--no-dev)
         fi
 
-        report="$RUNNER_TEMP/composer-audit.json"
-        set +e
-        composer "${args[@]}" > "$report"
-        code=$?
-        set -e
+        # One <dir> <report> <exit-code> triple per directory for summarize.php.
+        # A missing lock is reported, not fatal here, so the rest still run.
+        args=()
+        i=0
+        for dir in "${dirs[@]}"; do
+          i=$((i + 1))
+          report="$RUNNER_TEMP/composer-audit-$i.json"
+          : > "$report"
+          if [ ! -f "$dir/composer.lock" ]; then
+            echo "::error::No composer.lock in '$dir'. Check working_directory."
+            code=missing
+          else
+            set +e
+            (cd "$dir" && composer "${audit[@]}") > "$report"
+            code=$?
+            set -e
+          fi
+          args+=("$dir" "$report" "$code")
+        done
 
-        php "$GITHUB_ACTION_PATH/summarize.php" "$report" composer.lock "$code"
+        php "$GITHUB_ACTION_PATH/summarize.php" "${args[@]}"
