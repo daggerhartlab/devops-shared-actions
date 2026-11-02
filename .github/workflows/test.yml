@@ -770,6 +770,7 @@ jobs:
           expect '| a/chain | 7.3.2 | 7.4.22 |'
           expect '| a/lte | 2.10.1 | after 2.10.1 | X2: A \| B |'
           expect '| a/nofix | 1.2.0 | No fix released |'
+          # shellcheck disable=SC2016 # literal backticks: a markdown code span
           expect '| a/caret | 1.2.0 | Check advisory: `^1.0` |'
           expect '| a/multi | 3.1.0 | 3.2.1 | X5: t<br>X6: t |'
           grep -qxF 'advisory_count=7' "$dir/out" || { echo "::error::expected advisory_count=7"; fail=1; }
