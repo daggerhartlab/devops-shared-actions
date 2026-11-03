@@ -833,3 +833,116 @@ jobs:
           multi '**Audit failed** - No `composer.lock` in this directory.'
           grep -qxF 'package_count=6' "$dir/multi.out" || { echo "::error::multi package_count should total 6"; fail=1; }
           exit "$fail"
+
+  composer-diff:
+    name: Composer diff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: '8.3'
+
+      # Two local commits stand in for a PR: the first is the base, the second
+      # changes the root lock, adds a lock, and leaves the theme lock alone.
+      - name: Build fixture commits
+        id: fixture
+        run: |
+          git config user.name ci
+          git config user.email ci@example.com
+          lock() { printf '{"packages":[%s],"packages-dev":[]}\n' "$1"; }
+          pkg() { printf '{"name":"%s","version":"%s","type":"library"}' "$1" "$2"; }
+          mkdir -p diffix/theme
+          echo '{"require":{"acme/direct":"*"}}' > diffix/composer.json
+          lock "$(pkg acme/direct 1.0.0),$(pkg acme/transitive 2.0.0)" > diffix/composer.lock
+          echo '{"require":{"acme/theme-lib":"*"}}' > diffix/theme/composer.json
+          lock "$(pkg acme/theme-lib 3.0.0)" > diffix/theme/composer.lock
+          git add diffix
+          git commit -qm "fixture base"
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          lock "$(pkg acme/direct 1.1.0),$(pkg acme/transitive 2.0.1),$(pkg acme/new 0.1.0)" > diffix/composer.lock
+          mkdir -p diffix/added
+          echo '{}' > diffix/added/composer.json
+          lock "$(pkg acme/fresh 1.0.0)" > diffix/added/composer.lock
+          git add diffix
+          git commit -qm "fixture change"
+
+      - name: Run composer-diff (several directories)
+        id: multi
+        uses: ./.github/actions/composer-diff
+        with:
+          base: ${{ steps.fixture.outputs.base }}
+          working_directory: |
+            diffix
+            diffix/theme/
+            diffix/added
+          dry_run: 'true'
+
+      - name: Assert the multi-directory comment
+        env:
+          CHANGED: ${{ steps.multi.outputs.changed }}
+          FILE: ${{ steps.multi.outputs.comment_file }}
+          URL: ${{ steps.multi.outputs.comment_url }}
+        run: |
+          cat "$FILE"
+          fail=0
+          [ "$CHANGED" = "true" ] || { echo "::error::expected changed=true, got '$CHANGED'"; fail=1; }
+          [ -z "$URL" ]           || { echo "::error::dry_run still posted: $URL"; fail=1; }
+          head -n 1 "$FILE" | grep -qxF '<!-- composer-diff -->' || { echo "::error::comment must start with the marker"; fail=1; }
+          expect() { grep -qF -- "$1" "$FILE" || { echo "::error::comment is missing: $1"; fail=1; }; }
+          # shellcheck disable=SC2016 # literal backticks: markdown code spans
+          expect '#### `diffix/composer.lock`'
+          # shellcheck disable=SC2016
+          expect '#### `diffix/theme/composer.lock`'
+          # shellcheck disable=SC2016
+          expect '#### `diffix/added/composer.lock`'
+          expect '| acme/direct     | Upgraded  | 1.0.0 | 1.1.0  |'
+          expect '| acme/new        | New       | -     | 0.1.0  |'
+          expect '| acme/fresh    | New       | -    | 1.0.0  |'
+          # The unchanged theme lock collapses to one line.
+          awk '/diffix\/theme\/composer.lock/{getline; getline; print; exit}' "$FILE" | grep -qxF '✅ No changes.' \
+            || { echo "::error::unchanged lock should read '✅ No changes.'"; fail=1; }
+          exit "$fail"
+
+      - name: Run composer-diff (unchanged only)
+        id: unchanged
+        uses: ./.github/actions/composer-diff
+        with:
+          base: ${{ steps.fixture.outputs.base }}
+          working_directory: diffix/theme
+          dry_run: 'true'
+
+      - name: Run composer-diff (missing directory)
+        id: missing
+        continue-on-error: true
+        uses: ./.github/actions/composer-diff
+        with:
+          base: ${{ steps.fixture.outputs.base }}
+          working_directory: diffix/nope
+          dry_run: 'true'
+
+      - name: Run composer-diff (base not in checkout)
+        id: nobase
+        continue-on-error: true
+        uses: ./.github/actions/composer-diff
+        with:
+          base: 0000000000000000000000000000000000000000
+          working_directory: diffix
+          dry_run: 'true'
+
+      - name: Assert the other paths
+        env:
+          UNCHANGED: ${{ steps.unchanged.outputs.changed }}
+          UNCHANGED_FILE: ${{ steps.unchanged.outputs.comment_file }}
+          MISSING_OUTCOME: ${{ steps.missing.outcome }}
+          NOBASE_OUTCOME: ${{ steps.nobase.outcome }}
+        run: |
+          fail=0
+          [ "$UNCHANGED" = "false" ] || { echo "::error::an unchanged lock should give changed=false, got '$UNCHANGED'"; fail=1; }
+          # shellcheck disable=SC2016
+          grep -qxF '`diffix/theme/composer.lock`' "$UNCHANGED_FILE" || { echo "::error::single-lock comment should name the lock"; fail=1; }
+          [ "$(grep -cxF '✅ No changes.' "$UNCHANGED_FILE")" = "2" ] || { echo "::error::single unchanged lock should show No changes under both headings"; fail=1; }
+          [ "$MISSING_OUTCOME" = "failure" ] || { echo "::error::a directory with no lock on either side should fail, got '$MISSING_OUTCOME'"; fail=1; }
+          [ "$NOBASE_OUTCOME" = "failure" ]  || { echo "::error::a base missing from the checkout should fail, got '$NOBASE_OUTCOME'"; fail=1; }
+          exit "$fail"
