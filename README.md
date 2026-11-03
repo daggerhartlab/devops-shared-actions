@@ -30,6 +30,8 @@ every example below uses.
 - [`composer-audit`](#composer-audit) — runs `composer audit` against
   `composer.lock` and writes security advisories to the job summary, one row
   per package with the version that fixes them.
+- [`composer-diff`](#composer-diff) — comments on a pull request with the
+  package changes in each `composer.lock`, and keeps that comment current.
 
 All are composite actions; see each `action.yml` for the full,
 authoritative list of inputs and defaults. This README covers common usage
@@ -705,6 +707,84 @@ failed** under its heading; the others still report and the step then fails.
   queries: Packagist (which aggregates the GitHub and FriendsOfPHP databases)
   and any repository that publishes its own, such as packages.drupal.org.
 
+---
+
+## `composer-diff`
+
+Posts one comment on a pull request listing the Composer package changes,
+direct dependencies and all dependencies, and edits that same comment on
+later pushes instead of adding new ones.
+
+```yaml
+name: Composer diff
+
+on:
+  pull_request:
+    paths:
+      - 'composer.lock'
+      - '**/composer.lock'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Required - the base commit must be in the checkout to diff against.
+          fetch-depth: 0
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+        with:
+          php_version: '8.3'
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/composer-diff@v1
+```
+
+The tables come from
+[`ion-bazan/composer-diff`](https://github.com/IonBazan/composer-diff)
+(pinned), the same tool `IonBazan/composer-diff-action` runs, so the output
+matches that action's `pr` format. Each lock file is named above its tables.
+
+For several lock files, list each directory on its own line. The comment gets
+a section per lock, and one with no changes collapses to a single line:
+
+```yaml
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/composer-diff@v1
+        with:
+          working_directory: |
+            .
+            web/themes/custom/example
+```
+
+Inputs: `working_directory` (default `.`), `base` (default: the PR's base
+commit), `token` (default `GITHUB_TOKEN`), `dry_run`. Outputs: `changed`,
+`comment_file`, `comment_url`.
+
+### Gotchas
+
+- **`fetch-depth: 0` is required.** A shallow checkout does not contain the
+  base commit; the action fails saying so rather than reporting no changes.
+- **The comment is found by its first line, `<!-- composer-diff -->`.** A
+  comment left by an earlier workflow that starts with the same marker is
+  taken over and updated in place.
+- **No comment is created when nothing changed.** An existing comment is
+  still updated, so it never goes stale while the workflow runs.
+- **A reverted lock leaves the old comment.** With the `paths:` filter above,
+  a push that undoes the lock changes does not run the workflow, so the
+  comment still shows them. Drop the filter if that matters; the job is quick.
+- **Long diffs are shortened.** GitHub caps a comment at 65,536 characters.
+  Past that, the "All Dependencies" tables are replaced by a link to the job
+  summary, which always has the full output.
+- **A new or deleted lock is not an error.** Its packages show as new or
+  removed. A listed directory with no `composer.lock` on either side fails,
+  since that is almost always a typo.
+- **Pull requests from forks cannot be commented on** with `GITHUB_TOKEN`,
+  which is read-only for them.
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -722,6 +802,7 @@ once `v1` is moved onto it.
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
 | `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts `no_dev` excludes the dev package by default and includes it when off, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
+| `composer-diff` | Builds base and changed fixture commits, runs with `dry_run` across three lock files, asserts each is named, the changed tables are present, an unchanged lock collapses to one line, and a new lock shows its packages as new; that an unchanged-only run reports `changed=false`; and that a directory with no lock and a base missing from the checkout both fail |
 
 Two things worth knowing if you extend this:
 

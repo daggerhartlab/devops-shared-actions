@@ -1,0 +1,206 @@
+name: "Composer Diff"
+description: "Comments on a pull request with the Composer package changes in each composer.lock, and keeps that one comment up to date on later pushes."
+
+# Requires PHP and Composer on PATH - run setup-runner with php_version set
+# first - and a checkout with fetch-depth: 0, so the PR's base commit exists.
+#
+# Uses ion-bazan/composer-diff (the tool behind IonBazan/composer-diff-action),
+# installed into an isolated Composer home rather than run through that
+# action's Docker image, so it is pinned and skips an image build per run.
+inputs:
+  working_directory:
+    description: 'Directory holding composer.lock, relative to the repo root. For several, put one per line; each gets its own section in the comment.'
+    required: false
+    default: '.'
+  base:
+    description: 'Git ref to compare against. Leave unset to use the pull request base commit.'
+    required: false
+    default: ''
+  token:
+    description: 'Token used to read and write the PR comment. Leave unset to use the workflow GITHUB_TOKEN, which needs pull-requests: write.'
+    required: false
+    default: ''
+  dry_run:
+    description: "Build the comment and job summary but do not post. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+
+outputs:
+  changed:
+    description: "'true' if any listed composer.lock differs from the base."
+    value: ${{ steps.diff.outputs.changed }}
+  comment_file:
+    description: 'Path to the generated comment markdown.'
+    value: ${{ steps.diff.outputs.comment_file }}
+  comment_url:
+    description: 'URL of the created or updated comment; empty on a dry run or when nothing was posted.'
+    value: ${{ steps.comment.outputs.comment_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install composer-diff
+      shell: bash
+      run: |
+        if ! command -v composer >/dev/null 2>&1; then
+          echo "::error::composer not found on PATH. Run setup-runner with php_version set before this action."
+          exit 1
+        fi
+        # Its own COMPOSER_HOME keeps the plugin out of the job's global Composer.
+        home="$RUNNER_TEMP/composer-diff-home"
+        COMPOSER_HOME="$home" composer global config --no-interaction allow-plugins.ion-bazan/composer-diff true
+        COMPOSER_HOME="$home" composer global require --no-interaction --quiet ion-bazan/composer-diff:2.4.0
+        echo "COMPOSER_DIFF_HOME=$home" >> "$GITHUB_ENV"
+
+    - name: Diff lock files
+      id: diff
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        BASE_INPUT: ${{ inputs.base }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        base="${BASE_INPUT:-$PR_BASE_SHA}"
+        if [ -z "$base" ]; then
+          echo "::error::No base to compare against. Run on a pull_request event or pass base."
+          exit 1
+        fi
+        if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+          echo "::error::Base '$base' is not in this checkout. Use actions/checkout with fetch-depth: 0."
+          exit 1
+        fi
+
+        dirs=()
+        while IFS= read -r dir; do
+          dir="${dir#"${dir%%[![:space:]]*}"}"
+          dir="${dir%"${dir##*[![:space:]]}"}"
+          dir="${dir%/}"
+          if [ -n "$dir" ]; then
+            dirs+=("$dir")
+          fi
+        done <<< "$WORKING_DIRECTORY"
+        if [ "${#dirs[@]}" -eq 0 ]; then
+          dirs=(.)
+        fi
+
+        out=$(mktemp -d "$RUNNER_TEMP/composer-diff.XXXXXX")
+
+        run_diff() {
+          COMPOSER_HOME="$COMPOSER_DIFF_HOME" composer diff --no-ansi --no-interaction \
+            --format=pr --allow-missing "$@"
+        }
+
+        # One section file per lock, plus a short form whose "All" tables are
+        # swapped for a pointer to the job summary, for when the comment is
+        # too long for GitHub.
+        changed=false
+        i=0
+        for dir in "${dirs[@]}"; do
+          i=$((i + 1))
+          if [ "$dir" = "." ]; then
+            lock="composer.lock"
+          else
+            lock="$dir/composer.lock"
+          fi
+          if [ ! -f "$lock" ] && ! git cat-file -e "${base}:${lock}" 2>/dev/null; then
+            echo "::error::No $lock in the base or the PR. Check working_directory."
+            exit 1
+          fi
+
+          run_diff --direct "${base}:${lock}" "$lock" > "$out/direct-$i.md"
+          run_diff "${base}:${lock}" "$lock" > "$out/all-$i.md"
+          if [ -s "$out/all-$i.md" ]; then
+            changed=true
+            echo "$lock: changed"
+          else
+            echo "$lock: no changes"
+          fi
+          printf '%s\n' "$lock" > "$out/lock-$i"
+        done
+
+        section() {
+          # $1 index, $2 heading level for direct/all, $3 'full' or 'short'
+          local n=$1 level=$2 mode=$3
+          if [ ! -s "$out/all-$n.md" ] && [ "${#dirs[@]}" -gt 1 ]; then
+            echo "✅ No changes."
+            echo ""
+            return
+          fi
+          for kind in direct all; do
+            if [ "$kind" = direct ]; then label="🔍 Direct Dependencies"; else label="📦 All Dependencies"; fi
+            if [ "$level" = bold ]; then echo "**${label}**"; else echo "#### ${label}"; fi
+            echo ""
+            if [ ! -s "$out/$kind-$n.md" ]; then
+              echo "✅ No changes."
+            elif [ "$kind" = all ] && [ "$mode" = short ]; then
+              echo "_Too long for a PR comment. See the [job summary](${RUN_URL})._"
+            else
+              cat "$out/$kind-$n.md"
+            fi
+            echo ""
+          done
+        }
+
+        build() {
+          local mode=$1
+          echo "<!-- composer-diff -->"
+          echo "### 🧩 Composer Diff Summary"
+          echo ""
+          if [ "${#dirs[@]}" -eq 1 ]; then
+            echo "\`$(cat "$out/lock-1")\`"
+            echo ""
+            section 1 h4 "$mode"
+          else
+            for n in $(seq 1 "${#dirs[@]}"); do
+              echo "#### \`$(cat "$out/lock-$n")\`"
+              echo ""
+              section "$n" bold "$mode"
+            done
+          fi
+        }
+
+        build full > "$out/comment.md"
+        cp "$out/comment.md" "$out/summary.md"
+        # GitHub rejects comment bodies over 65536 characters.
+        if [ "$(wc -m < "$out/comment.md")" -gt 65000 ]; then
+          build short > "$out/comment.md"
+          echo "::notice::Composer diff too long for a PR comment; All Dependencies is in the job summary only."
+        fi
+        cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+        {
+          echo "changed=$changed"
+          echo "comment_file=$out/comment.md"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Post or update the PR comment
+      id: comment
+      if: ${{ contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.dry_run) }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        CHANGED: ${{ steps.diff.outputs.changed }}
+        BODY: ${{ steps.diff.outputs.comment_file }}
+      run: |
+        if [ -z "$PR" ]; then
+          echo "::error::Not a pull_request event, so there is no PR to comment on. Use dry_run outside pull requests."
+          exit 1
+        fi
+
+        existing=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+          --jq '.[] | select(.body | startswith("<!-- composer-diff -->")) | .id' | head -n 1)
+
+        if [ -n "$existing" ]; then
+          url=$(gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F "body=@${BODY}" --jq .html_url)
+          echo "Updated comment: $url"
+        elif [ "$CHANGED" = "true" ]; then
+          url=$(gh api -X POST "repos/${REPO}/issues/${PR}/comments" -F "body=@${BODY}" --jq .html_url)
+          echo "Created comment: $url"
+        else
+          echo "No composer.lock changes and no earlier comment - nothing to post."
+          url=""
+        fi
+        echo "comment_url=$url" >> "$GITHUB_OUTPUT"
