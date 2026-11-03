@@ -26,7 +26,7 @@ jobs:
         uses: ./.github/actions/composer-diff
         with:
           working_directory: |
-            .
             live-fixture
+            live-fixture/theme
 
       - run: echo "changed=${{ steps.diff.outputs.changed }} url=${{ steps.diff.outputs.comment_url }}"
