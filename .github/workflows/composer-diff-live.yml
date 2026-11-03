@@ -1,0 +1,32 @@
+# Throwaway: live test of composer-diff's PR comment. Not for merge.
+name: Composer diff live test
+
+on:
+  pull_request:
+    paths:
+      - 'live-fixture/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: '8.3'
+
+      - id: diff
+        uses: ./.github/actions/composer-diff
+        with:
+          working_directory: |
+            .
+            live-fixture
+
+      - run: echo "changed=${{ steps.diff.outputs.changed }} url=${{ steps.diff.outputs.comment_url }}"

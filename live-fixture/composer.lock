@@ -1,0 +1,1 @@
+{"packages":[{"name":"acme/direct","version":"1.0.0","type":"library"},{"name":"acme/transitive","version":"2.0.0","type":"library"}],"packages-dev":[]}
