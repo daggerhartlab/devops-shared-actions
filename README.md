@@ -387,6 +387,7 @@ jobs:
       - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
         with:
           php_version: '8.3'
+          node_version: ''
           install_wp_cli: 'true'
 
       - uses: daggerhartlab/devops-shared-actions/.github/actions/wp-core-update@v1
@@ -651,6 +652,7 @@ jobs:
       - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
         with:
           php_version: '8.3'
+          node_version: ''
 
       - uses: daggerhartlab/devops-shared-actions/.github/actions/composer-audit@v1
 ```
@@ -740,6 +742,7 @@ jobs:
       - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
         with:
           php_version: '8.3'
+          node_version: ''
 
       - uses: daggerhartlab/devops-shared-actions/.github/actions/composer-diff@v1
 ```
