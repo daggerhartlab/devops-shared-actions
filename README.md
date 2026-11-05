@@ -305,7 +305,8 @@ running and when it was built:
   "repository": "daggerhartlab/my-site",
   "actor": "jdaggerhart",
   "run_url": "https://github.com/daggerhartlab/my-site/actions/runs/123456789",
-  "tag_count": 13
+  "tag_count": 13,
+  "version": "2026.10.19.r13"
 }
 ```
 
@@ -315,6 +316,37 @@ push. `commit` is the checked-out `HEAD`, not the artifact repo's commit.
 `git ls-remote` so it doesn't depend on `fetch-depth` or fetched tags. It
 needs the credentials `actions/checkout` persists by default, so don't set
 `persist-credentials: false` on a private repo.
+
+`version` is `YYYY.MM.DD.r<tag_count>`, built from the same UTC timestamp
+as `deployed_at`. It's the name this deploy would be released under. The `r`
+number is the tag this deploy would add, so it only goes up when a tag is
+pushed. Two deploys on the same day with no tag between them get the same
+`version`. To make it unique per deploy, tag each one with it, as below. The
+action itself never creates tags. It's also exposed as the `deploy_version`
+step output:
+
+```yaml
+permissions:
+  contents: write  # only needed to push the tag below
+
+steps:
+  - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+    with:
+      configure_git_identity: 'true'  # git tag -a needs an identity
+
+  - id: site-build
+    uses: daggerhartlab/devops-shared-actions/.github/actions/site-build@v1
+    with:
+      deploy_version_file: .deploy-version.json
+
+  # Optional: tag the source commit with the build's version.
+  - shell: bash
+    env:
+      VERSION: ${{ steps.site-build.outputs.deploy_version }}
+    run: |
+      git tag -a "$VERSION" -m "Deploy $VERSION"
+      git push origin "$VERSION"
+```
 
 The file only exists on the runner, so add it to the dev repo's
 `.gitignore` to keep a stray local copy out, and make sure the artifact

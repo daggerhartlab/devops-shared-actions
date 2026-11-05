@@ -19,9 +19,14 @@ inputs:
     required: false
     default: ''
   deploy_version_file:
-    description: 'Path (relative to repo root) to write a JSON file recording this build: UTC timestamp, source commit, repository, actor, run URL, and tag count + 1, e.g. .deploy-version.json. It must not be ignored by the artifact repo''s .gitignore, or it won''t be deployed. Leave unset to skip.'
+    description: 'Path (relative to repo root) to write a JSON file recording this build: UTC timestamp, source commit, repository, actor, run URL, tag count + 1, and a version string (YYYY.MM.DD.r<tag count>), e.g. .deploy-version.json. It must not be ignored by the artifact repo''s .gitignore, or it won''t be deployed. Leave unset to skip.'
     required: false
     default: ''
+
+outputs:
+  deploy_version:
+    description: 'The version string written to deploy_version_file (YYYY.MM.DD.r<tag count>). Empty when deploy_version_file is unset.'
+    value: ${{ steps.deploy-version.outputs.version }}
 
 runs:
   using: "composite"
@@ -79,6 +84,7 @@ runs:
 
     ## Write deploy version file
     - name: Write deploy version file
+      id: deploy-version
       if: ${{ inputs.deploy_version_file != '' }}
       shell: bash
       env:
@@ -87,12 +93,17 @@ runs:
         mkdir -p "$(dirname "$DEPLOY_VERSION_FILE")"
         # Remote, since actions/checkout doesn't fetch tags by default.
         tag_count=$(( $(git ls-remote --tags --refs origin | wc -l) + 1 ))
+        # One date call for both fields, so they can't straddle a UTC midnight.
+        read -r deployed_at day < <(date -u '+%Y-%m-%dT%H:%M:%SZ %Y.%m.%d')
+        version="${day}.r${tag_count}"
         jq -n \
-          --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg deployed_at "$deployed_at" \
           --arg commit "$(git rev-parse HEAD)" \
           --arg repository "$GITHUB_REPOSITORY" \
           --arg actor "$GITHUB_ACTOR" \
           --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
           --argjson tag_count "$tag_count" \
+          --arg version "$version" \
           '$ARGS.named' > "$DEPLOY_VERSION_FILE"
         cat "$DEPLOY_VERSION_FILE"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
