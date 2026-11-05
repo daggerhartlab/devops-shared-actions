@@ -304,12 +304,17 @@ running and when it was built:
   "commit": "35c33de54a1f…",
   "repository": "daggerhartlab/my-site",
   "actor": "jdaggerhart",
-  "run_url": "https://github.com/daggerhartlab/my-site/actions/runs/123456789"
+  "run_url": "https://github.com/daggerhartlab/my-site/actions/runs/123456789",
+  "tag_count": 13
 }
 ```
 
 `deployed_at` is build time, which in a deploy job is seconds before the
 push. `commit` is the checked-out `HEAD`, not the artifact repo's commit.
+`tag_count` is the number of tags on `origin` plus one, read with
+`git ls-remote` so it doesn't depend on `fetch-depth` or fetched tags. It
+needs the credentials `actions/checkout` persists by default, so don't set
+`persist-credentials: false` on a private repo.
 
 The file only exists on the runner, so add it to the dev repo's
 `.gitignore` to keep a stray local copy out, and make sure the artifact

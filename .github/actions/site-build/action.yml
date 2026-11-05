@@ -19,7 +19,7 @@ inputs:
     required: false
     default: ''
   deploy_version_file:
-    description: 'Path (relative to repo root) to write a JSON file recording this build: UTC timestamp, source commit, repository, actor, and run URL, e.g. .deploy-version.json. It must not be ignored by the artifact repo''s .gitignore, or it won''t be deployed. Leave unset to skip.'
+    description: 'Path (relative to repo root) to write a JSON file recording this build: UTC timestamp, source commit, repository, actor, run URL, and tag count + 1, e.g. .deploy-version.json. It must not be ignored by the artifact repo''s .gitignore, or it won''t be deployed. Leave unset to skip.'
     required: false
     default: ''
 
@@ -85,11 +85,14 @@ runs:
         DEPLOY_VERSION_FILE: ${{ inputs.deploy_version_file }}
       run: |
         mkdir -p "$(dirname "$DEPLOY_VERSION_FILE")"
+        # Remote, since actions/checkout doesn't fetch tags by default.
+        tag_count=$(( $(git ls-remote --tags --refs origin | wc -l) + 1 ))
         jq -n \
           --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg commit "$(git rev-parse HEAD)" \
           --arg repository "$GITHUB_REPOSITORY" \
           --arg actor "$GITHUB_ACTOR" \
           --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          --argjson tag_count "$tag_count" \
           '$ARGS.named' > "$DEPLOY_VERSION_FILE"
         cat "$DEPLOY_VERSION_FILE"
