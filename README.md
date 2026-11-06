@@ -329,6 +329,11 @@ step output:
 permissions:
   contents: write  # only needed to push the tag below
 
+# Overlapping runs would compute the same version and collide on the tag.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
 steps:
   - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
     with:
@@ -339,14 +344,27 @@ steps:
     with:
       deploy_version_file: .deploy-version.json
 
-  # Optional: tag the source commit with the build's version.
-  - shell: bash
+  # Optional: tag the source commit with the build's version. Local only
+  # until the deploy succeeds. Create it before any step that commits, so
+  # HEAD is still the source commit.
+  - name: Create release tag
+    shell: bash
     env:
       VERSION: ${{ steps.site-build.outputs.deploy_version }}
-    run: |
-      git tag -a "$VERSION" -m "Deploy $VERSION"
-      git push origin "$VERSION"
+    run: git tag -a "$VERSION" -m "Deploy $VERSION"
+
+  # ... deploy steps (e.g. terminus build:env:push) ...
+
+  - name: Push release tag
+    shell: bash
+    env:
+      VERSION: ${{ steps.site-build.outputs.deploy_version }}
+    run: git push origin "refs/tags/$VERSION"
 ```
+
+A failed deploy never pushes its tag, so the `r` number only counts
+successful deploys. `terminus build:env:push` pushes only the branch to
+Pantheon, not tags, so the local tag doesn't leak there either.
 
 The file only exists on the runner, so add it to the dev repo's
 `.gitignore` to keep a stray local copy out, and make sure the artifact
