@@ -697,13 +697,13 @@ jobs:
         uses: ./.github/actions/composer-audit
         with:
           working_directory: auditfix
+          no_dev: 'true'
 
-      - name: Run composer-audit (including dev)
+      - name: Run composer-audit (default, including dev)
         id: dev
         uses: ./.github/actions/composer-audit
         with:
           working_directory: auditfix
-          no_dev: 'false'
 
       - name: Run composer-audit (clean)
         id: clean
@@ -753,13 +753,13 @@ jobs:
           fail=0
           [ "$PROD_PACKAGES" = "1" ]   || { echo "::error::expected 1 production package, got '$PROD_PACKAGES'"; fail=1; }
           [ "${PROD_ADVISORIES:-0}" -ge 1 ] || { echo "::error::expected advisories for symfony/http-kernel 4.4.0, got '$PROD_ADVISORIES'"; fail=1; }
-          [ "$DEV_PACKAGES" = "2" ]    || { echo "::error::no_dev=false should add phpunit, got '$DEV_PACKAGES' packages"; fail=1; }
+          [ "$DEV_PACKAGES" = "2" ]    || { echo "::error::the default should include phpunit, got '$DEV_PACKAGES' packages"; fail=1; }
           [ "$CLEAN_ADVISORIES" = "0" ] || { echo "::error::clean fixture reported '$CLEAN_ADVISORIES' advisories"; fail=1; }
           [ "$NOLOCK_OUTCOME" = "failure" ] || { echo "::error::a missing composer.lock should fail, got '$NOLOCK_OUTCOME'"; fail=1; }
           [ "$MULTI_OUTCOME" = "success" ]  || { echo "::error::two valid directories should pass, got '$MULTI_OUTCOME'"; fail=1; }
-          [ "$MULTI_PACKAGES" = "1" ]       || { echo "::error::expected 1 package across auditfix + cleanfix, got '$MULTI_PACKAGES'"; fail=1; }
+          [ "$MULTI_PACKAGES" = "2" ]       || { echo "::error::expected 2 packages across auditfix + cleanfix (dev included by default), got '$MULTI_PACKAGES'"; fail=1; }
           [ "$MISSING_OUTCOME" = "failure" ] || { echo "::error::a listed directory with no lock should fail, got '$MISSING_OUTCOME'"; fail=1; }
-          [ "$MISSING_PACKAGES" = "1" ]     || { echo "::error::auditfix should still report alongside a missing directory, got '$MISSING_PACKAGES'"; fail=1; }
+          [ "$MISSING_PACKAGES" = "2" ]     || { echo "::error::auditfix should still report alongside a missing directory, got '$MISSING_PACKAGES'"; fail=1; }
           exit "$fail"
 
       # The Fixed-in logic against synthetic ranges, offline, so every shape

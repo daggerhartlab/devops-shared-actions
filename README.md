@@ -722,8 +722,9 @@ The summary looks like this:
 A clean project gets a one-line "No security advisories". Both are green runs —
 the step fails only when the audit itself could not run.
 
-Inputs: `working_directory` (default `.`), `no_dev` (default `true`, audits
-production packages only). Outputs: `advisory_count`, `package_count`.
+Inputs: `working_directory` (default `.`), `no_dev` (default `false`, audits
+require-dev packages too; `'true'` audits production packages only).
+Outputs: `advisory_count`, `package_count`.
 
 ### Several Composer directories
 
@@ -859,7 +860,7 @@ once `v1` is moved onto it.
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
-| `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts `no_dev` excludes the dev package by default and includes it when off, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
+| `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts the dev package is included by default and excluded with `no_dev`, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
 | `composer-diff` | Builds base and changed fixture commits, runs with `dry_run` across three lock files, asserts each is named, the changed tables are present, an unchanged lock collapses to one line, and a new lock shows its packages as new; that an unchanged-only run reports `changed=false`; and that a directory with no lock and a base missing from the checkout both fail |
 
 Two things worth knowing if you extend this:

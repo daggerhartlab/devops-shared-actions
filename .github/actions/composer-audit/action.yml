@@ -13,9 +13,9 @@ inputs:
     required: false
     default: '.'
   no_dev:
-    description: "Audit production packages only. Pass 'false'/'0'/'no'/'off' to include require-dev packages."
+    description: "Pass 'true' to audit production packages only. By default require-dev packages are audited too; unset/'false'/'0'/'no'/'off' keep that."
     required: false
-    default: 'true'
+    default: 'false'
 
 outputs:
   advisory_count:
