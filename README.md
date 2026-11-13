@@ -887,20 +887,35 @@ repo root sets the scope, what to report, and what to skip, and is read
 alongside `CLAUDE.md`. Edit it to tune reviews without touching the workflow.
 Without one, Claude reports only correctness bugs and security issues.
 
-Inputs: `exclude_paths` (default none), `model` (default: the
-`claude-code-action` default), `timeout_minutes` (default `20`). Secret:
-`CLAUDE_CODE_OAUTH_TOKEN`, required.
+Inputs: `include_paths` (default: the whole repo), `exclude_paths` (default
+none), `model` (default: the `claude-code-action` default), `timeout_minutes`
+(default `20`). Secret: `CLAUDE_CODE_OAUTH_TOKEN`, required.
 
-### Excluding paths
+### Limiting the review to some paths
 
-`exclude_paths` takes one git glob per line, relative to the repo root: `*`
-stays within a directory, `**` crosses them. Matching files are removed from
-the diff before Claude sees it, so large exported content costs nothing to
-skip. A PR that only touches excluded paths is not reviewed; on an `@claude`
-request, a one-line comment says so. The job summary shows how many files
-were reviewed and excluded.
+Both path inputs take one git glob per line, relative to the repo root: `*`
+stays within a directory, `**` crosses them. Files outside `include_paths`,
+or matching `exclude_paths`, are removed from the diff before Claude sees it,
+so large exported content or vendored code costs nothing to skip. A PR with
+no changed file left in scope is not reviewed; on an `@claude` request, a
+one-line comment says so. The job summary shows how many files were reviewed
+and left out.
 
-Use `exclude_paths` for whole files that should never be reviewed, and
+Use `include_paths` where most committed code isn't yours, as on WordPress
+sites that commit core and third-party plugins: a plugin update PR would
+otherwise send Claude hundreds of thousands of diff lines.
+
+```yaml
+    with:
+      include_paths: |
+        composer.json
+        wp-content/mu-plugins/example/**
+        wp-content/themes/example/**
+      exclude_paths: |
+        wp-content/themes/example/vendor/**
+```
+
+Use the path inputs for whole files that should never be reviewed, and
 `REVIEW.md` for anything that needs judgment.
 
 ### Gotchas

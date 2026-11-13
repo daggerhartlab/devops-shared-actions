@@ -6,6 +6,11 @@ name: Claude code review
 on:
   workflow_call:
     inputs:
+      include_paths:
+        description: 'Paths to review, one git glob per line, relative to the repo root (e.g. wp-content/themes/my-theme/**). Leave unset to review the whole repo. exclude_paths still applies within these.'
+        type: string
+        required: false
+        default: ''
       exclude_paths:
         description: 'Paths left out of the review, one git glob per line, relative to the repo root (e.g. web/modules/custom/*/lark_exports/**). A PR that only touches excluded paths is not reviewed.'
         type: string
@@ -72,18 +77,33 @@ jobs:
         id: diff
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
+          INCLUDE_PATHS: ${{ inputs.include_paths }}
           EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
         run: |
           merge_base=$(git merge-base "$BASE_SHA" HEAD)
 
-          pathspec=(.)
+          # Prints each non-blank line of $1, trimmed.
+          lines() {
+            local p
+            while IFS= read -r p; do
+              p="${p#"${p%%[![:space:]]*}"}"
+              p="${p%"${p##*[![:space:]]}"}"
+              if [ -n "$p" ]; then
+                printf '%s\n' "$p"
+              fi
+            done <<< "$1"
+          }
+
+          pathspec=()
           while IFS= read -r p; do
-            p="${p#"${p%%[![:space:]]*}"}"
-            p="${p%"${p##*[![:space:]]}"}"
-            if [ -n "$p" ]; then
-              pathspec+=(":(exclude,glob)$p")
-            fi
-          done <<< "$EXCLUDE_PATHS"
+            pathspec+=(":(glob)$p")
+          done < <(lines "$INCLUDE_PATHS")
+          if [ "${#pathspec[@]}" -eq 0 ]; then
+            pathspec=(.)
+          fi
+          while IFS= read -r p; do
+            pathspec+=(":(exclude,glob)$p")
+          done < <(lines "$EXCLUDE_PATHS")
 
           mkdir -p "$REVIEW_DIR"
           git diff --name-only "$merge_base" HEAD > "$REVIEW_DIR/all-files.txt"
@@ -102,7 +122,7 @@ jobs:
           {
             echo "### Claude review scope"
             echo ""
-            echo "$files file(s) reviewed ($lines diff lines), $excluded excluded by \`exclude_paths\`."
+            echo "$files file(s) reviewed ($lines diff lines), $excluded left out by \`include_paths\`/\`exclude_paths\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Nothing to review
@@ -112,10 +132,10 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
         run: |
-          echo "::notice::Every changed file matches exclude_paths; skipping the review."
+          echo "::notice::No changed file is in review scope (include_paths/exclude_paths); skipping the review."
           # Only answer an explicit @claude request; a new PR needs no comment.
           if [ "$EVENT" = "issue_comment" ]; then
-            gh pr comment "$PR" -R "$REPO" --body "No review: every changed file matches \`exclude_paths\`."
+            gh pr comment "$PR" -R "$REPO" --body "No review: no changed file is in review scope (\`include_paths\`/\`exclude_paths\`)."
           fi
 
       - if: steps.diff.outputs.files != '0'
@@ -136,9 +156,9 @@ jobs:
             (${{ steps.diff.outputs.files }} files, ${{ steps.diff.outputs.lines }} lines), and
             ${{ env.REVIEW_DIR }}/files.txt lists its files. Read those
             instead of fetching the diff yourself; they leave out paths this
-            repo excludes from review. ${{ env.REVIEW_DIR }}/excluded.txt
+            repo keeps out of review. ${{ env.REVIEW_DIR }}/excluded.txt
             lists the ${{ steps.diff.outputs.excluded }} changed files that were
-            excluded: don't review or comment on them.
+            left out: don't review or comment on them.
 
             Start with `gh pr view --comments`, then list the existing inline
             comments with
@@ -164,5 +184,5 @@ jobs:
             - Then post exactly one summary with `gh pr comment`: a one-line
               verdict, a bullet list of the issues (most severe first), and
               anything notable that you couldn't anchor to a line. If files
-              were excluded, end with one line saying how many. If you found
+              were left out, end with one line saying how many. If you found
               nothing, say so in one line. Don't summarize what the PR does.
