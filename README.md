@@ -926,9 +926,12 @@ Use the path inputs for whole files that should never be reviewed, and
 - **The caller must grant all three permissions.** A reusable workflow can
   only narrow the caller's permissions; `id-token: write` is how
   `claude-code-action` gets its GitHub App token.
-- **`REVIEW.md` and every `CLAUDE.md` come from the base branch,** so a PR
-  can't rewrite the rules for its own review. Edits to them are reviewed as
-  part of the diff and take effect once merged.
+- **Review rules come from the base branch,** so a PR can't rewrite the rules
+  for its own review: the root `REVIEW.md` and `CLAUDE.md`, plus any
+  `CLAUDE.md` inside the review scope. Edits to them are reviewed as part of
+  the diff and take effect once merged. Every other `CLAUDE.md`, such as ones
+  shipped inside third-party plugins, is removed before the review, so keep
+  third-party code out of scope with `include_paths` or `exclude_paths`.
 - **Claude has no shell.** It can read files and post inline comments, nothing
   else; the workflow fetches the PR conversation for it and posts its summary,
   so the summary comes from `github-actions` rather than Claude.
