@@ -929,6 +929,9 @@ Use the path inputs for whole files that should never be reviewed, and
 - **`REVIEW.md` and every `CLAUDE.md` come from the base branch,** so a PR
   can't rewrite the rules for its own review. Edits to them are reviewed as
   part of the diff and take effect once merged.
+- **Claude has no shell.** It can read files and post inline comments, nothing
+  else; the workflow fetches the PR conversation for it and posts its summary,
+  so the summary comes from `github-actions` rather than Claude.
 - **Comments from bots and from people without write access are ignored**
   for `@claude`. The first is this workflow's `if`, the second is
   `claude-code-action`'s own check.
