@@ -142,7 +142,10 @@ jobs:
         uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The action defaults to auto mode, where a safety check can approve
+          # tools outside --allowedTools; default mode denies them.
           claude_args: >-
+            --permission-mode default
             --add-dir ${{ env.REVIEW_DIR }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/comments:*)"
             ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
