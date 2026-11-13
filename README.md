@@ -878,6 +878,7 @@ jobs:
     secrets: inherit
     with:
       exclude_paths: |
+        **/composer.lock
         web/modules/custom/*/lark_exports/**
 ```
 
@@ -890,10 +891,24 @@ Inputs: `include_paths` (default: the whole repo), `exclude_paths` (default
 none), `model` (default: the `claude-code-action` default), `timeout_minutes`
 (default `20`). Secret: `CLAUDE_CODE_OAUTH_TOKEN`, required.
 
+### Setup
+
+1. Create the token: run `claude setup-token` while logged in to the Claude
+   account the reviews should bill to, and copy the token it prints.
+2. Save it as an Actions secret named `CLAUDE_CODE_OAUTH_TOKEN`, on the
+   consumer repo or once for the org. `secrets: inherit` passes it through.
+3. Add the caller workflow above and a `REVIEW.md`.
+
+The token doesn't refresh itself; when reviews start failing to
+authenticate, create a new one and replace the secret.
+
 ### Limiting the review to some paths
 
 Both path inputs take one git glob per line, relative to the repo root: `*`
-stays within a directory, `**` crosses them. Files outside `include_paths`,
+stays within a directory, `**` crosses them. A pattern matches from the
+root, so `vendor/**` only covers the top-level `vendor/`; use `**/vendor/**`
+for every `vendor/` directory, and `**/composer.lock` for every lock file,
+whose diffs are long and rarely worth a review. Files outside `include_paths`,
 or matching `exclude_paths`, are removed from the diff before Claude sees it,
 so large exported content or vendored code costs nothing to skip. A PR with
 no changed file left in scope is not reviewed; on an `@claude` request, a
