@@ -138,6 +138,24 @@ jobs:
             gh pr comment "$PR" -R "$REPO" --body "No review: no changed file is in review scope (\`include_paths\`/\`exclude_paths\`)."
           fi
 
+      # These files steer the review, so a PR mustn't be able to rewrite them
+      # for its own review. Its edits to them are still in the diff.
+      - name: Take review instructions from the base branch
+        if: steps.diff.outputs.files != '0'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          pattern='(^|/)CLAUDE\.md$|^REVIEW\.md$'
+          mapfile -t head_files < <(git ls-files | grep -E "$pattern" || true)
+          mapfile -t base_files < <(git ls-tree -r --name-only "$BASE_SHA" | grep -E "$pattern" || true)
+          if [ "${#head_files[@]}" -gt 0 ]; then
+            rm -f -- "${head_files[@]}"
+          fi
+          if [ "${#base_files[@]}" -gt 0 ]; then
+            git checkout "$BASE_SHA" -- "${base_files[@]}"
+          fi
+          echo "From the base branch: ${base_files[*]:-none}"
+
       - if: steps.diff.outputs.files != '0'
         uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
         with:

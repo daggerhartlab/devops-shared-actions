@@ -926,8 +926,9 @@ Use the path inputs for whole files that should never be reviewed, and
 - **The caller must grant all three permissions.** A reusable workflow can
   only narrow the caller's permissions; `id-token: write` is how
   `claude-code-action` gets its GitHub App token.
-- **`REVIEW.md` is read from the PR branch,** so a PR can change its own
-  review rules. Fine for private repos with trusted contributors.
+- **`REVIEW.md` and every `CLAUDE.md` come from the base branch,** so a PR
+  can't rewrite the rules for its own review. Edits to them are reviewed as
+  part of the diff and take effect once merged.
 - **Comments from bots and from people without write access are ignored**
   for `@claude`. The first is this workflow's `if`, the second is
   `claude-code-action`'s own check.
