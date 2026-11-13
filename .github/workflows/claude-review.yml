@@ -84,6 +84,9 @@ jobs:
           INCLUDE_PATHS: ${{ inputs.include_paths }}
           EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
         run: |
+          # Print non-ASCII paths as-is rather than quoted octal escapes, for
+          # Claude's file lists and the instruction-file restore below.
+          git config core.quotePath false
           merge_base=$(git merge-base "$BASE_SHA" HEAD)
 
           # Prints each non-blank line of $1, trimmed.
