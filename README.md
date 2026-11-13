@@ -944,6 +944,9 @@ Use the path inputs for whole files that should never be reviewed, and
   skip the job. `claude-code-action` also requires write access, so a
   read-only collaborator's `@claude` fails the run, and cancels a review in
   progress on that PR.
+- **Pull requests opened by bots or GitHub Apps** (Dependabot, an app token)
+  aren't reviewed when opened; `claude-code-action` refuses them. One opened
+  with a personal access token counts as that user's.
 - **Pull requests from forks** aren't reviewed when opened, since they get no
   secrets. A maintainer's `@claude` on one does review it, reading the
   fork's code; Claude can only read, so that's safe, but the fork's text

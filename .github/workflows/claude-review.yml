@@ -32,11 +32,13 @@ on:
 
 jobs:
   review:
-    # Non-draft PRs from this repo (fork PRs get no secrets), or "@claude"
-    # comments on PRs by repo owners, members and collaborators.
+    # Non-draft PRs opened by people in this repo (fork PRs get no secrets,
+    # and claude-code-action rejects bot-opened ones), or "@claude" comments
+    # on PRs by repo owners, members and collaborators.
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot') ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
