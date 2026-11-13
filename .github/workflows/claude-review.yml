@@ -303,6 +303,11 @@ jobs:
             mv "$out/next.json" "$out/comments.json"
           done
 
+          # GitHub rejects a COMMENT review with an empty body.
+          if ! grep -q '[^[:space:]]' "$out/summary.md"; then
+            if ((n > 0)); then echo "See inline comments."; else echo "No issues found."; fi > "$out/summary.md"
+          fi
+
           # $1: file holding the inline comments to attach.
           post_review() {
             jq -n --arg sha "$HEAD_SHA" --rawfile body "$out/summary.md" --slurpfile comments "$1" \
