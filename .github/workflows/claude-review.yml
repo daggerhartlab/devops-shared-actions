@@ -123,6 +123,7 @@ jobs:
           excluded=$(wc -l < "$REVIEW_DIR/excluded.txt" | tr -d ' ')
           lines=$(wc -l < "$REVIEW_DIR/pr.diff" | tr -d ' ')
           {
+            echo "head=$(git rev-parse HEAD)"
             echo "files=$files"
             echo "excluded=$excluded"
             echo "lines=$lines"
@@ -265,6 +266,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           OUTPUT: ${{ steps.claude.outputs.structured_output }}
+          # The commit Claude read, so comments stay on the right lines if
+          # someone pushes during the review.
+          HEAD_SHA: ${{ steps.diff.outputs.head }}
         run: |
           out="$RUNNER_TEMP/review-post"
           mkdir -p "$out"
@@ -301,8 +305,8 @@ jobs:
 
           # $1: file holding the inline comments to attach.
           post_review() {
-            jq -n --rawfile body "$out/summary.md" --slurpfile comments "$1" \
-              '{event: "COMMENT", body: $body, comments: $comments[0]}' > "$out/review.json"
+            jq -n --arg sha "$HEAD_SHA" --rawfile body "$out/summary.md" --slurpfile comments "$1" \
+              '{commit_id: $sha, event: "COMMENT", body: $body, comments: $comments[0]}' > "$out/review.json"
             gh api -X POST "repos/$REPO/pulls/$PR/reviews" --input "$out/review.json" --jq .html_url
           }
 
