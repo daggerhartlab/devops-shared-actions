@@ -1,0 +1,168 @@
+name: Claude code review
+
+# Reusable workflow. The caller owns the triggers (pull_request and
+# issue_comment) and must grant contents: read, pull-requests: write and
+# id-token: write. Repo-specific review rules live in the caller's REVIEW.md.
+on:
+  workflow_call:
+    inputs:
+      exclude_paths:
+        description: 'Paths left out of the review, one git glob per line, relative to the repo root (e.g. web/modules/custom/*/lark_exports/**). A PR that only touches excluded paths is not reviewed.'
+        type: string
+        required: false
+        default: ''
+      model:
+        description: 'Claude model to review with. Leave unset for the claude-code-action default.'
+        type: string
+        required: false
+        default: ''
+      timeout_minutes:
+        description: 'Job timeout in minutes.'
+        type: number
+        required: false
+        default: 20
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  review:
+    # Non-draft PRs, or "@claude" comments by people on PRs (not plain issues).
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      contains(github.event.comment.body, '@claude'))
+    # Job-level so skipped runs (any non-@claude PR comment) don't cancel an
+    # in-progress review.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    env:
+      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+    steps:
+      # Read before checkout so the base tip is guaranteed to be in the fetch.
+      - name: Find the PR base
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha=$(gh pr view "$PR" -R "$REPO" --json baseRefOid --jq .baseRefOid)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # The runner context isn't available in job-level env.
+          echo "REVIEW_DIR=$RUNNER_TEMP/claude-review" >> "$GITHUB_ENV"
+
+      # The PR head, not the merge ref, so file line numbers match the lines
+      # inline comments anchor to. Blobless full history for the merge base;
+      # git diff fetches the blobs it needs, so keep the persisted credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number || github.event.issue.number }}/head
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Build the review diff
+        id: diff
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+        run: |
+          merge_base=$(git merge-base "$BASE_SHA" HEAD)
+
+          pathspec=(.)
+          while IFS= read -r p; do
+            p="${p#"${p%%[![:space:]]*}"}"
+            p="${p%"${p##*[![:space:]]}"}"
+            if [ -n "$p" ]; then
+              pathspec+=(":(exclude,glob)$p")
+            fi
+          done <<< "$EXCLUDE_PATHS"
+
+          mkdir -p "$REVIEW_DIR"
+          git diff --name-only "$merge_base" HEAD > "$REVIEW_DIR/all-files.txt"
+          git diff --name-only "$merge_base" HEAD -- "${pathspec[@]}" > "$REVIEW_DIR/files.txt"
+          git diff --no-ext-diff "$merge_base" HEAD -- "${pathspec[@]}" > "$REVIEW_DIR/pr.diff"
+          grep -vxFf "$REVIEW_DIR/files.txt" "$REVIEW_DIR/all-files.txt" > "$REVIEW_DIR/excluded.txt" || true
+
+          files=$(wc -l < "$REVIEW_DIR/files.txt" | tr -d ' ')
+          excluded=$(wc -l < "$REVIEW_DIR/excluded.txt" | tr -d ' ')
+          lines=$(wc -l < "$REVIEW_DIR/pr.diff" | tr -d ' ')
+          {
+            echo "files=$files"
+            echo "excluded=$excluded"
+            echo "lines=$lines"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Claude review scope"
+            echo ""
+            echo "$files file(s) reviewed ($lines diff lines), $excluded excluded by \`exclude_paths\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to review
+        if: steps.diff.outputs.files == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "::notice::Every changed file matches exclude_paths; skipping the review."
+          # Only answer an explicit @claude request; a new PR needs no comment.
+          if [ "$EVENT" = "issue_comment" ]; then
+            gh pr comment "$PR" -R "$REPO" --body "No review: every changed file matches \`exclude_paths\`."
+          fi
+
+      - if: steps.diff.outputs.files != '0'
+        uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --add-dir ${{ env.REVIEW_DIR }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/comments:*)"
+            ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ env.PR }}
+
+            Review this pull request.
+
+            The diff to review is ${{ env.REVIEW_DIR }}/pr.diff
+            (${{ steps.diff.outputs.files }} files, ${{ steps.diff.outputs.lines }} lines), and
+            ${{ env.REVIEW_DIR }}/files.txt lists its files. Read those
+            instead of fetching the diff yourself; they leave out paths this
+            repo excludes from review. ${{ env.REVIEW_DIR }}/excluded.txt
+            lists the ${{ steps.diff.outputs.excluded }} changed files that were
+            excluded: don't review or comment on them.
+
+            Start with `gh pr view --comments`, then list the existing inline
+            comments with
+            `gh api repos/${{ github.repository }}/pulls/${{ env.PR }}/comments --paginate`.
+
+            Read REVIEW.md and CLAUDE.md at the repo root, plus any CLAUDE.md in
+            the directories the PR touches. REVIEW.md defines the scope, what to
+            report and what to skip; follow it, and where it disagrees with
+            CLAUDE.md, REVIEW.md wins. If there is no REVIEW.md, report only
+            correctness bugs and security issues, and skip style, formatting
+            and personal preference. You can read the surrounding files for
+            context.
+
+            Don't repeat yourself: skip any issue that already has an inline
+            comment on the same problem, even if the line has moved. If an
+            earlier issue is still unfixed, list it in the summary as still
+            open instead of commenting on it again.
+
+            How to report:
+            - Use mcp__github_inline_comment__create_inline_comment for each
+              specific issue, on the exact line. Say what goes wrong and when,
+              and include a suggested fix where it's short.
+            - Then post exactly one summary with `gh pr comment`: a one-line
+              verdict, a bullet list of the issues (most severe first), and
+              anything notable that you couldn't anchor to a line. If files
+              were excluded, end with one line saying how many. If you found
+              nothing, say so in one line. Don't summarize what the PR does.

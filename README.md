@@ -33,9 +33,15 @@ every example below uses.
 - [`composer-diff`](#composer-diff) — comments on a pull request with the
   package changes in each `composer.lock`, and keeps that comment current.
 
-All are composite actions; see each `action.yml` for the full,
-authoritative list of inputs and defaults. This README covers common usage
-patterns and the gotchas we've already hit.
+Reusable workflows:
+
+- [`claude-review`](#claude-review) — reviews pull requests with Claude,
+  following the consumer's `REVIEW.md`, and re-reviews on an `@claude`
+  comment.
+
+The actions are composite actions; see each `action.yml` (or the workflow
+file) for the full, authoritative list of inputs and defaults. This README
+covers common usage patterns and the gotchas we've already hit.
 
 ---
 
@@ -844,6 +850,74 @@ commit), `token` (default `GITHUB_TOKEN`), `dry_run`. Outputs: `changed`,
 - **Pull requests from forks cannot be commented on** with `GITHUB_TOKEN`,
   which is read-only for them.
 
+## `claude-review`
+
+A reusable workflow, not an action: it lives at
+`.github/workflows/claude-review.yml` and is called as a whole job with
+`uses:`. Claude reviews each non-draft PR once, on open, reopen, or ready for
+review, posting inline comments and one summary comment. Comment `@claude` on
+the PR to re-review after new pushes; issues it already commented on are
+listed as still open rather than repeated.
+
+```yaml
+name: Claude code review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  review:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review.yml@v1
+    secrets: inherit
+    with:
+      exclude_paths: |
+        web/modules/custom/*/lark_exports/**
+```
+
+What to review lives in the consumer repo, not here: a `REVIEW.md` at the
+repo root sets the scope, what to report, and what to skip, and is read
+alongside `CLAUDE.md`. Edit it to tune reviews without touching the workflow.
+Without one, Claude reports only correctness bugs and security issues.
+
+Inputs: `exclude_paths` (default none), `model` (default: the
+`claude-code-action` default), `timeout_minutes` (default `20`). Secret:
+`CLAUDE_CODE_OAUTH_TOKEN`, required.
+
+### Excluding paths
+
+`exclude_paths` takes one git glob per line, relative to the repo root: `*`
+stays within a directory, `**` crosses them. Matching files are removed from
+the diff before Claude sees it, so large exported content costs nothing to
+skip. A PR that only touches excluded paths is not reviewed; on an `@claude`
+request, a one-line comment says so. The job summary shows how many files
+were reviewed and excluded.
+
+Use `exclude_paths` for whole files that should never be reviewed, and
+`REVIEW.md` for anything that needs judgment.
+
+### Gotchas
+
+- **Don't add workflow-level `concurrency` in the caller.** Every comment on
+  a PR starts a run, and a workflow-level group would let any comment cancel
+  a review in progress. The workflow sets job-level concurrency itself.
+- **The caller must grant all three permissions.** A reusable workflow can
+  only narrow the caller's permissions; `id-token: write` is how
+  `claude-code-action` gets its GitHub App token.
+- **`REVIEW.md` is read from the PR branch,** so a PR can change its own
+  review rules. Fine for private repos with trusted contributors.
+- **Comments from bots and from people without write access are ignored**
+  for `@claude`. The first is this workflow's `if`, the second is
+  `claude-code-action`'s own check.
+- **Pull requests from forks don't get secrets** and fail to review.
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -877,4 +951,6 @@ Two things worth knowing if you extend this:
   default branch and disables them after 60 days of repo inactivity.
 
 Credentialed paths (SSH, Terminus, Acquia CLI) are intentionally untested —
-they need live secrets and can't run on PRs from forks.
+they need live secrets and can't run on PRs from forks. The same goes for
+`claude-review`, which `lint` checks but nothing runs; test it on `daglab`
+against a branch ref before moving `v1`.
