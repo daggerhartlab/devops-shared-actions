@@ -1,8 +1,8 @@
 name: Claude code review
 
 # Reusable workflow. The caller owns the triggers (pull_request and
-# issue_comment) and must grant contents: read, pull-requests: write and
-# id-token: write. Repo-specific review rules live in the caller's REVIEW.md.
+# issue_comment) and must grant contents: read and pull-requests: write.
+# Repo-specific review rules live in the caller's REVIEW.md.
 on:
   workflow_call:
     inputs:
@@ -48,7 +48,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     env:
       PR: ${{ github.event.pull_request.number || github.event.issue.number }}
     steps:
@@ -186,6 +185,9 @@ jobs:
         uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1.0.275
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The job token, limited to the permissions above and expiring with
+          # the job, instead of the broader Claude GitHub App token.
+          github_token: ${{ github.token }}
           # The action defaults to auto mode, where a safety check can approve
           # tools outside --allowedTools; default mode denies them. No shell:
           # inputs are pre-fetched and the summary is posted by a later step.

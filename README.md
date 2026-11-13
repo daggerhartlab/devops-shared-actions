@@ -871,7 +871,6 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  id-token: write
 
 jobs:
   review:
@@ -923,9 +922,10 @@ Use the path inputs for whole files that should never be reviewed, and
 - **Don't add workflow-level `concurrency` in the caller.** Every comment on
   a PR starts a run, and a workflow-level group would let any comment cancel
   a review in progress. The workflow sets job-level concurrency itself.
-- **The caller must grant all three permissions.** A reusable workflow can
-  only narrow the caller's permissions; `id-token: write` is how
-  `claude-code-action` gets its GitHub App token.
+- **The caller must grant both permissions.** A reusable workflow can only
+  narrow the caller's permissions. Claude works with the job's own
+  `GITHUB_TOKEN`, so the Claude GitHub App doesn't need to be installed and
+  comments come from `github-actions`.
 - **Review rules come from the base branch,** so a PR can't rewrite the rules
   for its own review: the root `REVIEW.md` and `CLAUDE.md`, plus any
   `CLAUDE.md` inside the review scope. Edits to them are reviewed as part of
@@ -933,8 +933,7 @@ Use the path inputs for whole files that should never be reviewed, and
   shipped inside third-party plugins, is removed before the review, so keep
   third-party code out of scope with `include_paths` or `exclude_paths`.
 - **Claude has no shell.** It can read files and post inline comments, nothing
-  else; the workflow fetches the PR conversation for it and posts its summary,
-  so the summary comes from `github-actions` rather than Claude.
+  else; the workflow fetches the PR conversation for it and posts its summary.
 - **Comments from bots and from people without write access are ignored**
   for `@claude`. The first is this workflow's `if`, the second is
   `claude-code-action`'s own check.
