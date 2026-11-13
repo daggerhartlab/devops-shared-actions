@@ -154,7 +154,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          gh pr view "$PR" -R "$REPO" --comments > "$REVIEW_DIR/conversation.txt"
+          # Explicit fields: the default view also reads check status, which
+          # this token can't.
+          gh pr view "$PR" -R "$REPO" --json title,author,body,comments,reviews --jq '
+            "# \(.title)\nby \(.author.login)\n\n\(.body)\n",
+            ((.comments | map(. + {kind: "comment"})) + (.reviews | map(. + {kind: "review \(.state)"}))
+              | sort_by(.createdAt // .submittedAt) | .[] | select((.body // "") != "")
+              | "---\n\(.author.login) (\(.kind)):\n\(.body)\n")
+          ' > "$REVIEW_DIR/conversation.txt"
           gh api --paginate "repos/$REPO/pulls/$PR/comments" \
             --jq '.[] | {path, line, original_line, user: .user.login, body}' \
             > "$REVIEW_DIR/inline-comments.jsonl"
