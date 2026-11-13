@@ -32,11 +32,14 @@ on:
 
 jobs:
   review:
-    # Non-draft PRs, or "@claude" comments by people on PRs (not plain issues).
+    # Non-draft PRs from this repo (fork PRs get no secrets), or "@claude"
+    # comments on PRs by repo owners, members and collaborators.
     if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
       contains(github.event.comment.body, '@claude'))
     # Job-level so skipped runs (any non-@claude PR comment) don't cancel an
     # in-progress review.

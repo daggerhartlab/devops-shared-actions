@@ -855,9 +855,9 @@ commit), `token` (default `GITHUB_TOKEN`), `dry_run`. Outputs: `changed`,
 A reusable workflow, not an action: it lives at
 `.github/workflows/claude-review.yml` and is called as a whole job with
 `uses:`. Claude reviews each non-draft PR once, on open, reopen, or ready for
-review, posting one PR review: a summary plus inline comments. Comment `@claude` on
-the PR to re-review after new pushes; issues it already commented on are
-listed as still open rather than repeated.
+review, posting one PR review: a summary plus inline comments. Comment
+`@claude` on the PR to re-review after new pushes; issues it already
+commented on are listed as still open rather than repeated.
 
 ```yaml
 name: Claude code review
@@ -939,10 +939,15 @@ Use the path inputs for whole files that should never be reviewed, and
   images, embedded HTML, HTML comments, and token-like strings removed. If
   GitHub rejects an inline comment (a line outside the diff), all of them
   are listed in the review body instead.
-- **Comments from bots and from people without write access are ignored**
-  for `@claude`. The first is this workflow's `if`, the second is
-  `claude-code-action`'s own check.
-- **Pull requests from forks don't get secrets** and fail to review.
+- **Who can ask for a review.** `@claude` only counts from the repo's
+  owner, org members, and collaborators; other comments, and any from bots,
+  skip the job. `claude-code-action` also requires write access, so a
+  read-only collaborator's `@claude` fails the run, and cancels a review in
+  progress on that PR.
+- **Pull requests from forks** aren't reviewed when opened, since they get no
+  secrets. A maintainer's `@claude` on one does review it, reading the
+  fork's code; Claude can only read, so that's safe, but the fork's text
+  can still try to steer the review.
 
 ## Testing
 
