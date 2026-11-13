@@ -189,13 +189,15 @@ jobs:
           # the job, instead of the broader Claude GitHub App token.
           github_token: ${{ github.token }}
           # The action defaults to auto mode, where a safety check can approve
-          # tools outside --allowedTools; default mode denies them. No shell:
-          # inputs are pre-fetched and the summary is posted by a later step.
+          # tools outside --allowedTools; default mode denies them. With no
+          # allow rules Claude can only read the checkout and the review
+          # files: no shell, no writes, no reads elsewhere on the runner. It
+          # returns its comments, and the workflow posts them.
           claude_args: >-
             --permission-mode default
             --add-dir ${{ env.REVIEW_DIR }}
-            --allowedTools "Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment"
-            --json-schema '{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}'
+            --disallowedTools "Read(./.git/**)"
+            --json-schema '{"type":"object","properties":{"summary":{"type":"string"},"comments":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"start_line":{"type":"integer"},"body":{"type":"string"}},"required":["path","line","body"]}}},"required":["summary","comments"]}'
             ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
           prompt: |
             REPO: ${{ github.repository }}
@@ -235,23 +237,76 @@ jobs:
             earlier issue is still unfixed, list it in the summary as still
             open instead of commenting on it again.
 
-            How to report:
-            - Use mcp__github_inline_comment__create_inline_comment for each
-              specific issue, on the exact line. Say what goes wrong and when,
-              and include a suggested fix where it's short.
-            - Then return the summary comment, in markdown, as `summary` in
-              your structured output; it is posted for you. Give a one-line
-              verdict, a bullet list of the issues (most severe first), and
-              anything notable that you couldn't anchor to a line. If files
-              were left out, end with one line saying how many. If you found
-              nothing, say so in one line. Don't summarize what the PR does.
+            How to report, in your structured output:
+            - `comments`: one entry per specific issue. `path` is relative to
+              the repo root. `line` is the line number in the file at the PR
+              head, and must be an added or unchanged line inside one of the
+              diff's hunks; add `start_line` to cover a range. `body` says what
+              goes wrong and when, with a suggested fix where it's short.
+              Issues on deleted lines or outside the hunks go in the summary.
+            - `summary`: markdown for the review body. Give a one-line verdict,
+              a bullet list of the issues (most severe first), and anything
+              notable that you couldn't anchor to a line. If files were left
+              out, end with one line saying how many. If you found nothing,
+              say so in one line. Don't summarize what the PR does.
+            Write plain markdown: images and HTML are removed before posting.
 
-      - name: Post the review summary
+      - name: Post the review
         if: steps.claude.outputs.structured_output != ''
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           OUTPUT: ${{ steps.claude.outputs.structured_output }}
         run: |
-          jq -r '.summary' <<< "$OUTPUT" > "$REVIEW_DIR/summary.md"
-          gh pr comment "$PR" -R "$REPO" --body-file "$REVIEW_DIR/summary.md"
+          out="$RUNNER_TEMP/review-post"
+          mkdir -p "$out"
+          printf '%s' "$OUTPUT" > "$out/raw.json"
+
+          # Claude's text is posted under this repo's name. Drop images and
+          # embedded media (viewers' browsers fetch their URLs, a way to leak
+          # data), HTML comments, invisible characters, and token-like strings.
+          sanitize() {
+            perl -CSD -0pe '
+              s/<!--.*?(?:-->|\z)//gs;
+              s/!\[[^\]]*\]\([^)]*\)//g;
+              s/!\[[^\]]*\]\[[^\]]*\]//g;
+              s/^[ \t]*\[[^\]]+\]:[ \t]*\S+.*$//gm;
+              s/<\/?(?:img|picture|source|video|audio|iframe|object|embed|svg)\b[^>]*>//gi;
+              s/[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{FEFF}]//g;
+              s/\b(?:sk-ant-[\w-]{8,}|gh[opsur]_\w{20,}|github_pat_\w{20,})/[redacted]/g;
+            '
+          }
+
+          jq -r '.summary // ""' "$out/raw.json" | sanitize > "$out/summary.md"
+          echo '[]' > "$out/comments.json"
+          n=$(jq '.comments // [] | length' "$out/raw.json")
+          for ((i = 0; i < n; i++)); do
+            jq -r --argjson i "$i" '.comments[$i].body' "$out/raw.json" | sanitize > "$out/body.md"
+            jq --argjson i "$i" --rawfile body "$out/body.md" --slurpfile raw "$out/raw.json" '
+              . + [$raw[0].comments[$i]
+                | {path, line, side: "RIGHT", body: $body}
+                  + (if (.start_line // 0) > 0 and .start_line < .line
+                     then {start_line, start_side: "RIGHT"} else {} end)]
+            ' "$out/comments.json" > "$out/next.json"
+            mv "$out/next.json" "$out/comments.json"
+          done
+
+          # $1: file holding the inline comments to attach.
+          post_review() {
+            jq -n --rawfile body "$out/summary.md" --slurpfile comments "$1" \
+              '{event: "COMMENT", body: $body, comments: $comments[0]}' > "$out/review.json"
+            gh api -X POST "repos/$REPO/pulls/$PR/reviews" --input "$out/review.json" --jq .html_url
+          }
+
+          if ! post_review "$out/comments.json"; then
+            # One comment off the diff rejects the whole review, so fall back
+            # to listing the comments in the review body.
+            echo "::warning::GitHub rejected the inline comments; listing them in the review body."
+            {
+              echo ""
+              echo "#### Comments"
+              jq -r '.[] | "\n**`\(.path):\(.line)`**\n\n\(.body)"' "$out/comments.json"
+            } | sanitize >> "$out/summary.md"
+            echo '[]' > "$out/none.json"
+            post_review "$out/none.json"
+          fi

@@ -855,7 +855,7 @@ commit), `token` (default `GITHUB_TOKEN`), `dry_run`. Outputs: `changed`,
 A reusable workflow, not an action: it lives at
 `.github/workflows/claude-review.yml` and is called as a whole job with
 `uses:`. Claude reviews each non-draft PR once, on open, reopen, or ready for
-review, posting inline comments and one summary comment. Comment `@claude` on
+review, posting one PR review: a summary plus inline comments. Comment `@claude` on
 the PR to re-review after new pushes; issues it already commented on are
 listed as still open rather than repeated.
 
@@ -932,8 +932,13 @@ Use the path inputs for whole files that should never be reviewed, and
   the diff and take effect once merged. Every other `CLAUDE.md`, such as ones
   shipped inside third-party plugins, is removed before the review, so keep
   third-party code out of scope with `include_paths` or `exclude_paths`.
-- **Claude has no shell.** It can read files and post inline comments, nothing
-  else; the workflow fetches the PR conversation for it and posts its summary.
+- **Claude can only read.** It reads the checkout (not `.git`) and the
+  files the workflow prepares for it: the diff and the PR conversation. It
+  has no shell, can't write, and can't read elsewhere on the runner. It
+  returns its comments, and the workflow posts them as one review, with
+  images, embedded HTML, HTML comments, and token-like strings removed. If
+  GitHub rejects an inline comment (a line outside the diff), all of them
+  are listed in the review body instead.
 - **Comments from bots and from people without write access are ignored**
   for `@claude`. The first is this workflow's `if`, the second is
   `claude-code-action`'s own check.
