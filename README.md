@@ -877,6 +877,8 @@ jobs:
     uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review.yml@v1
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LABBY_CLAUDE_CODE_OAUTH_TOKEN }}
+      JIRA_EMAIL: ${{ secrets.LABBY_JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.LABBY_JIRA_API_TOKEN }}
     with:
       exclude_paths: |
         **/composer.lock
@@ -890,7 +892,9 @@ Without one, Claude reports only correctness bugs and security issues.
 
 Inputs: `include_paths` (default: the whole repo), `exclude_paths` (default
 none), `model` (default: the `claude-code-action` default), `timeout_minutes`
-(default `20`). Secret: `CLAUDE_CODE_OAUTH_TOKEN`, required.
+(default `20`), `jira_url` (default `https://daggerhart.atlassian.net`).
+Secrets: `CLAUDE_CODE_OAUTH_TOKEN`, required; `JIRA_EMAIL` and
+`JIRA_API_TOKEN`, optional.
 
 ### Setup
 
@@ -902,10 +906,44 @@ none), `model` (default: the `claude-code-action` default), `timeout_minutes`
    `CLAUDE_CODE_OAUTH_TOKEN` under `secrets:`, as above. `secrets: inherit`
    won't do: it only passes secrets under their own names, and only within
    the same org.
-3. Add the caller workflow above and a `REVIEW.md`.
+3. Optional, for the Jira ticket: in the `daggerhartlab` org these are the
+   org secrets `LABBY_JIRA_EMAIL` and `LABBY_JIRA_API_TOKEN`. Leave both out
+   to review without the ticket.
+4. Add the caller workflow above and a `REVIEW.md`.
 
 The token doesn't refresh itself; when reviews start failing to
 authenticate, create a new one and replace the secret.
+
+### The Jira ticket
+
+With the Jira secrets set, the workflow reads the ticket the PR is for and
+gives it to Claude, which uses it to understand what the PR is meant to do
+and lists requirements the diff misses or contradicts in the summary. It
+looks for the ticket in this order:
+
+1. a link to it on `jira_url` in the PR description, as the PR templates ask
+   for: `/browse/KEY-123`, `.../issues/KEY-123`, or a board or list link
+   with `selectedIssue=KEY-123`;
+2. the branch name prefix, `KEY-123--name`;
+3. the PR title prefix, `KEY-123: ...`.
+
+Claude gets the ticket's summary, type, status, parent, and description,
+then as many of its newest comments as fit in about 32 KB in all, with a note
+saying how many older ones were left out; not attachments, images, or linked
+issues. If there's no ticket or it can't be read, the review goes ahead
+without it and the run shows a warning. The job summary names the ticket used.
+
+The token must be a scoped API token with only `read:jira-work`, so it can't
+change anything in Jira even though its account can. It sees whatever
+projects its account can browse. Scoped tokens only work through
+`api.atlassian.com`, so the workflow looks up the site's cloud ID from
+`jira_url`.
+
+Ticket text goes to Claude with the code, and anything Claude takes from it
+can show up in the review. Like the PR description, it's treated as material
+to review, never as instructions. To change how much weight it gets, say so
+in `REVIEW.md`, e.g. "Missed acceptance criteria are inline comments" or
+"Don't report missing requirements".
 
 ### Limiting the review to some paths
 
@@ -953,7 +991,8 @@ Use the path inputs for whole files that should never be reviewed, and
   shipped inside third-party plugins, is removed before the review, so keep
   third-party code out of scope with `include_paths` or `exclude_paths`.
 - **Claude can only read.** It reads the checkout (not `.git`) and the
-  files the workflow prepares for it: the diff and the PR conversation. It
+  files the workflow prepares for it: the diff, the PR conversation, and
+  the Jira ticket. It
   has no shell, can't write, and can't read elsewhere on the runner. It
   returns its comments, and the workflow posts them as one review, with
   images, embedded HTML, HTML comments, and token-like strings removed. If
