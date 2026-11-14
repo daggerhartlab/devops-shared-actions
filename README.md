@@ -875,7 +875,8 @@ permissions:
 jobs:
   review:
     uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review.yml@v1
-    secrets: inherit
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LABBY_CLAUDE_CODE_OAUTH_TOKEN }}
     with:
       exclude_paths: |
         **/composer.lock
@@ -895,8 +896,12 @@ none), `model` (default: the `claude-code-action` default), `timeout_minutes`
 
 1. Create the token: run `claude setup-token` while logged in to the Claude
    account the reviews should bill to, and copy the token it prints.
-2. Save it as an Actions secret named `CLAUDE_CODE_OAUTH_TOKEN`, on the
-   consumer repo or once for the org. `secrets: inherit` passes it through.
+2. Save it as an Actions secret. In the `daggerhartlab` org it's the org
+   secret `LABBY_CLAUDE_CODE_OAUTH_TOKEN`; a repo in another org needs its
+   own repo secret. The caller maps it to the workflow's
+   `CLAUDE_CODE_OAUTH_TOKEN` under `secrets:`, as above. `secrets: inherit`
+   won't do: it only passes secrets under their own names, and only within
+   the same org.
 3. Add the caller workflow above and a `REVIEW.md`.
 
 The token doesn't refresh itself; when reviews start failing to
