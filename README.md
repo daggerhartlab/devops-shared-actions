@@ -102,6 +102,32 @@ connection, so add `pdo_mysql` (and whatever your test suite touches):
     php_extensions: gd, curl, bcmath, mbstring, dom, xml, pdo_mysql, zip, intl
 ```
 
+### Private Composer packages
+
+By default Composer authenticates to GitHub with the workflow's
+`GITHUB_TOKEN`, which can only read the repo the workflow runs in. A package
+pulled from another private repo (a `vcs` repository in `composer.json`)
+fails to download with an HTTP 404, not a 403.
+
+Pass a token that can read those repos as `composer_github_token`:
+
+```yaml
+- uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+  with:
+    php_version: '8.3'
+    composer_github_token: ${{ secrets.COMPOSER_GITHUB_TOKEN }}
+```
+
+`setup-runner` exports it as `COMPOSER_AUTH` for the rest of the job, so
+`site-build`, `composer-audit`, and any later `composer` step use it without
+further configuration. The action can't default to an org secret, because
+composite actions have no access to `secrets`, so each workflow has to pass it.
+
+Use a fine-grained token with read-only **Contents** access to just the
+private package repos. Composer runs package plugins and scripts during
+install, and any of them can read `COMPOSER_AUTH`, so don't reuse a token that
+can push or open PRs.
+
 ### Deploying to Pantheon
 
 A full, working deploy job looks like this — see **Known gotchas** below

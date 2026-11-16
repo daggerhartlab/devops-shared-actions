@@ -46,6 +46,10 @@ inputs:
     description: 'Composer version'
     required: false
     default: 'v2'
+  composer_github_token:
+    description: 'Token Composer uses for GitHub API requests and downloads, e.g. to install packages from private repos. Exported to the rest of the job as COMPOSER_AUTH, so later Composer steps (site-build, composer-audit) use it too. Leave unset to use the workflow GITHUB_TOKEN, which can only read the current repo. Prefer a fine-grained, read-only token scoped to the private package repos.'
+    required: false
+    default: ''
 
   # Node
   node_version:
@@ -135,6 +139,7 @@ runs:
         php-version: ${{ inputs.php_version }}
         extensions: ${{ inputs.php_extensions }}
         tools: composer:${{ inputs.composer_version }}
+        github-token: ${{ inputs.composer_github_token || github.token }}
 
     # Composer caching to speed up installation of composer packages.
     - name: 'Get Composer Cache Directory'
