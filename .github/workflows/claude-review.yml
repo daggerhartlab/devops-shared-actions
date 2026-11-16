@@ -17,10 +17,15 @@ on:
         required: false
         default: ''
       model:
-        description: 'Claude model to review with. Leave unset for the claude-code-action default.'
+        description: 'Claude model to review with, as a model ID or an alias (opus, sonnet, haiku). Pass an empty string for the claude-code-action default.'
         type: string
         required: false
-        default: ''
+        default: 'claude-opus-5-5'
+      effort:
+        description: 'Effort level for the review (low, medium, high, xhigh, max). Pass an empty string for the Claude Code default.'
+        type: string
+        required: false
+        default: 'medium'
       timeout_minutes:
         description: 'Job timeout in minutes.'
         type: number
@@ -308,6 +313,7 @@ jobs:
             --disallowedTools "Read(./.git/**)"
             --json-schema '{"type":"object","properties":{"summary":{"type":"string"},"comments":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"start_line":{"type":"integer"},"body":{"type":"string"}},"required":["path","line","body"]}}},"required":["summary","comments"]}'
             ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
+            ${{ inputs.effort && format('--effort {0}', inputs.effort) || '' }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ env.PR }}

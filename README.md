@@ -917,8 +917,8 @@ alongside `CLAUDE.md`. Edit it to tune reviews without touching the workflow.
 Without one, Claude reports only correctness bugs and security issues.
 
 Inputs: `include_paths` (default: the whole repo), `exclude_paths` (default
-none), `model` (default: the `claude-code-action` default), `timeout_minutes`
-(default `20`), `jira_url` (default `https://daggerhart.atlassian.net`).
+none), `model` (default `claude-opus-5-5`), `effort` (default `medium`),
+`timeout_minutes` (default `20`), `jira_url` (default `https://daggerhart.atlassian.net`).
 Secrets: `CLAUDE_CODE_OAUTH_TOKEN`, required; `JIRA_EMAIL` and
 `JIRA_API_TOKEN`, optional.
 
