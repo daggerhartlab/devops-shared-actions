@@ -36,6 +36,11 @@ on:
         type: string
         required: false
         default: 'https://daggerhart.atlassian.net'
+      composer_dirs:
+        description: 'Directories to run composer install in, without scripts, one per line, relative to the repo root (. for the root, or a theme with its own lock), so Claude can read the dependencies (vendor/, contrib modules, plugins) the PR code calls. A failed install only skips that directory. Leave unset to skip.'
+        type: string
+        required: false
+        default: ''
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -44,6 +49,9 @@ on:
         required: false
       JIRA_API_TOKEN:
         description: 'Scoped Jira API token with read:jira-work for that account.'
+        required: false
+      COMPOSER_AUTH:
+        description: 'Composer auth JSON for private packages, used by composer_dirs.'
         required: false
 
 jobs:
@@ -264,6 +272,54 @@ jobs:
           echo "Jira ticket: $key"
           echo "Jira ticket: $key" >> "$GITHUB_STEP_SUMMARY"
 
+      # Optional, and never fails the job: a directory that fails is reviewed
+      # without its dependencies' code. The PR head's locks, so added packages
+      # are there. Plugins stay on so packages land at their installer paths and
+      # patches apply; --no-scripts keeps the PR's composer.json scripts from
+      # running. The site never boots, so the runner's PHP is enough.
+      - name: Install Composer dependencies
+        id: composer
+        if: steps.diff.outputs.files != '0' && inputs.composer_dirs != ''
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+          COMPOSER_DIRS: ${{ inputs.composer_dirs }}
+        run: |
+          if [ -z "$COMPOSER_AUTH" ]; then
+            unset COMPOSER_AUTH
+          fi
+          installed=()
+          failed=()
+          while IFS= read -r dir; do
+            dir="${dir#"${dir%%[![:space:]]*}"}"
+            dir="${dir%"${dir##*[![:space:]]}"}"
+            if [ -z "$dir" ]; then
+              continue
+            fi
+            if [ ! -f "$dir/composer.json" ]; then
+              echo "::warning::No composer.json in $dir; reviewing without its dependencies."
+              failed+=("$dir")
+            elif composer install --working-dir="$dir" --no-interaction --no-progress --no-scripts --ignore-platform-reqs; then
+              installed+=("$dir")
+            else
+              echo "::warning::composer install failed in $dir; reviewing without its dependencies."
+              failed+=("$dir")
+            fi
+          done <<< "$COMPOSER_DIRS"
+          {
+            echo "installed=${installed[*]}"
+            echo "failed=${failed[*]}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Composer dependencies installed in: ${installed[*]:-none}. Failed: ${failed[*]:-none}." >> "$GITHUB_STEP_SUMMARY"
+
+          # Claude loads a nested CLAUDE.md as instructions when it reads that
+          # directory, so drop any that packages shipped. Runs after a failed
+          # install too, which can leave packages behind. Untracked files,
+          # ignored or not.
+          {
+            git ls-files -z --others --exclude-standard
+            git ls-files -z --others --exclude-standard --ignored
+          } | { grep -zE '(^|/)CLAUDE(\.local)?\.md$' || true; } | xargs -0 -r rm -f --
+
       # These files steer the review, so a PR mustn't be able to rewrite them
       # for its own review; its edits to them are still in the diff. Only the
       # root files and CLAUDE.md files inside the review scope are kept, so
@@ -327,6 +383,16 @@ jobs:
             repo keeps out of review. ${{ env.REVIEW_DIR }}/excluded.txt
             lists the ${{ steps.diff.outputs.excluded }} changed files that were
             left out: don't review or comment on them.
+
+            Dependencies: composer install ran in: ${{ steps.composer.outputs.installed || 'none' }}
+            (failed in: ${{ steps.composer.outputs.failed || 'none' }}). Where it
+            ran, Composer packages are in the checkout at their installed paths
+            (vendor/, and installer paths such as web/modules/contrib).
+            Elsewhere, Composer packages, such as contrib modules and plugins,
+            may be missing from the checkout.
+            When a finding depends on how a dependency behaves, read its code
+            first. If it isn't in the checkout, don't guess at its API or
+            behavior: say in the summary what you couldn't check.
 
             ${{ env.REVIEW_DIR }}/conversation.txt has the PR description and
             conversation, and ${{ env.REVIEW_DIR }}/inline-comments.jsonl has

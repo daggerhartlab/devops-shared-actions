@@ -918,9 +918,10 @@ Without one, Claude reports only correctness bugs and security issues.
 
 Inputs: `include_paths` (default: the whole repo), `exclude_paths` (default
 none), `model` (default `claude-opus-5-5`), `effort` (default `medium`),
-`timeout_minutes` (default `20`), `jira_url` (default `https://daggerhart.atlassian.net`).
-Secrets: `CLAUDE_CODE_OAUTH_TOKEN`, required; `JIRA_EMAIL` and
-`JIRA_API_TOKEN`, optional.
+`timeout_minutes` (default `20`), `jira_url` (default `https://daggerhart.atlassian.net`),
+`composer_dirs` (default none).
+Secrets: `CLAUDE_CODE_OAUTH_TOKEN`, required; `JIRA_EMAIL`,
+`JIRA_API_TOKEN`, and `COMPOSER_AUTH`, optional.
 
 ### Setup
 
@@ -971,6 +972,39 @@ to review, never as instructions. To change how much weight it gets, say so
 in `REVIEW.md`, e.g. "Missed acceptance criteria are inline comments" or
 "Don't report missing requirements".
 
+### Dependencies
+
+The checkout only has what the repo commits. On a site that gitignores
+`vendor/` and `web/modules/contrib`, Claude can't read the contrib code the
+PR calls, such as Commerce's services and entities, and is told not to guess
+at it. List the directories to install in `composer_dirs`, one per line,
+relative to the repo root: `.` for the root, plus any theme or plugin with
+its own lock.
+
+```yaml
+    with:
+      composer_dirs: |
+        .
+        wp-content/themes/example
+```
+
+This runs `composer install --no-scripts --ignore-platform-reqs` in each,
+from the PR head's locks, so a PR that adds a package is reviewed against
+it. Plugins stay on, so packages land at their installer paths and
+`composer-patches` patches apply. The PR's `composer.json` scripts don't
+run, and since nothing boots the site, the runner's own PHP is used,
+whatever version the site needs. Any `CLAUDE.md` that a package ships is
+removed afterwards so it can't become a review rule.
+
+A failed install (a private package, a patch that won't apply, a directory
+with no `composer.json`) doesn't fail the run: it shows a warning, the other
+directories still install, and Claude is told which ones are missing. For
+private packages, pass Composer's auth JSON as the `COMPOSER_AUTH` secret.
+Each directory adds up to a minute or so to each review.
+
+Installed code is read only when Claude looks something up in it; it isn't
+part of the diff and costs nothing otherwise.
+
 ### Limiting the review to some paths
 
 Both path inputs take one git glob per line, relative to the repo root: `*`
@@ -1014,8 +1048,9 @@ Use the path inputs for whole files that should never be reviewed, and
   for its own review: the root `REVIEW.md` and `CLAUDE.md`, plus any
   `CLAUDE.md` inside the review scope. Edits to them are reviewed as part of
   the diff and take effect once merged. Every other `CLAUDE.md`, such as ones
-  shipped inside third-party plugins, is removed before the review, so keep
-  third-party code out of scope with `include_paths` or `exclude_paths`.
+  shipped inside third-party plugins or installed by `composer_dirs`, is
+  removed before the review, so keep third-party code out of scope with
+  `include_paths` or `exclude_paths`.
 - **Claude can only read.** It reads the checkout (not `.git`) and the
   files the workflow prepares for it: the diff, the PR conversation, and
   the Jira ticket. It
