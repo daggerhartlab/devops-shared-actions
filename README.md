@@ -882,8 +882,9 @@ A reusable workflow, not an action: it lives at
 `.github/workflows/claude-review.yml` and is called as a whole job with
 `uses:`. Claude reviews each non-draft PR once, on open, reopen, or ready for
 review, posting one PR review: a summary plus inline comments. Comment
-`@claude` on the PR to re-review after new pushes; issues it already
-commented on are listed as still open rather than repeated.
+`@claude` on the PR to re-review after new pushes; unfixed issues from
+unresolved threads are listed as still open rather than repeated, and
+resolved threads aren't raised again.
 
 ```yaml
 name: Claude code review
