@@ -1,0 +1,235 @@
+name: "Drupal Module Test"
+description: "Builds a Drupal site around a custom module checked out in the workspace, then runs the module's PHPUnit tests, PHPCS and PHPStan."
+
+# Why this exists:
+# A module repository has no Drupal site to test in. This builds one from
+# drupal/recommended-project, installs the checkout from a symlinked path
+# repository - the same layout as local module development - and runs the
+# module's tests with core's phpunit.xml.dist.
+#
+# What stays in the consuming workflow:
+# - actions/checkout of the module.
+# - setup-runner, for PHP, its extensions and the Composer cache.
+# - The database service. Composite actions can't declare service
+#   containers, so Kernel and Functional tests get the database through
+#   simpletest_db.
+
+inputs:
+  module_path:
+    description: 'Path to the module checkout, relative to the workspace. Must contain the composer.json that names the module.'
+    required: false
+    default: '.'
+  drupal:
+    description: "Composer constraint for drupal/recommended-project and drupal/core-dev, e.g. '^11' or '11.x-dev'."
+    required: false
+    default: '^11'
+  stability:
+    description: "Minimum stability for the built site. Use 'dev' with a dev constraint such as '11.x-dev'."
+    required: false
+    default: 'stable'
+  phpunit:
+    description: "Run the module's PHPUnit tests. On by default; 'false'/'0'/'no'/'off' disable."
+    required: false
+    default: 'true'
+  phpunit_args:
+    description: "Extra arguments for PHPUnit, split on spaces, e.g. '--testsuite unit' or '--group foo'."
+    required: false
+    default: ''
+  simpletest_db:
+    description: 'Database URL for Kernel and Functional tests, e.g. mysql://root:root@127.0.0.1:3306/drupal. Leave unset to use SIMPLETEST_DB from the job environment.'
+    required: false
+    default: ''
+  phpcs:
+    description: "Run PHPCS over the module. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+  phpcs_standard:
+    description: 'PHPCS standard(s) or a path to a ruleset file.'
+    required: false
+    default: 'Drupal,DrupalPractice'
+  phpstan:
+    description: "Run PHPStan over the module, with phpstan-drupal and the deprecation rules. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+  phpstan_level:
+    description: 'PHPStan rule level, 0-10 or max.'
+    required: false
+    default: '2'
+  report_only:
+    description: "Report PHPCS and PHPStan errors without failing the step, for a module that doesn't pass them yet. PHPUnit is never report-only. Accepts 'true' to enable; unset/'false'/'0'/'no'/'off' disable."
+    required: false
+    default: ''
+  artifact_name:
+    description: 'Name of the artifact uploaded when PHPUnit fails. Leave unset to derive one from the job, Drupal constraint and PHP version, which is unique across a matrix.'
+    required: false
+    default: ''
+
+outputs:
+  drupal_root:
+    description: 'Absolute path to the built Drupal project (contains vendor/ and web/).'
+    value: ${{ steps.build.outputs.drupal_root }}
+  module_dir:
+    description: 'Absolute path to the module inside the built site, the symlink Drupal loads it through.'
+    value: ${{ steps.build.outputs.module_dir }}
+  package:
+    description: "The module's Composer package name."
+    value: ${{ steps.build.outputs.package }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build Drupal around the module
+      id: build
+      shell: bash
+      env:
+        MODULE_PATH: ${{ inputs.module_path }}
+        DRUPAL: ${{ inputs.drupal }}
+        STABILITY: ${{ inputs.stability }}
+      run: |
+        # A fresh directory per run, so a job can use the action more than once.
+        PROJECT_DIR="$(mktemp -d "${RUNNER_TEMP}/drupal-module-test.XXXXXX")/drupal"
+        export PROJECT_DIR
+        bash "${GITHUB_ACTION_PATH}/build.sh"
+
+    - name: Start the web server
+      if: ${{ !contains(fromJSON('["false", "0", "no", "off"]'), inputs.phpunit) }}
+      shell: bash
+      env:
+        DRUPAL_ROOT: ${{ steps.build.outputs.drupal_root }}
+      run: |
+        if curl -s -o /dev/null http://127.0.0.1:8888/; then
+          echo "::error::Something is already listening on 127.0.0.1:8888. PHPUnit runs once per job; split runs with phpunit enabled into separate jobs."
+          exit 1
+        fi
+
+        log="${RUNNER_TEMP}/drupal-module-test-server.log"
+        # The router path is resolved from the docroot, so start from web/.
+        # The built-in server handles one request at a time unless given
+        # workers; a page that requests the same server again would deadlock.
+        cd "${DRUPAL_ROOT}/web"
+        PHP_CLI_SERVER_WORKERS=5 nohup php -S 127.0.0.1:8888 .ht.router.php > "$log" 2>&1 &
+
+        if ! timeout 30 bash -c 'until curl -s -o /dev/null http://127.0.0.1:8888/; do sleep 1; done'; then
+          echo "::error::The PHP web server did not respond within 30 seconds."
+          cat "$log"
+          exit 1
+        fi
+
+    - name: PHPUnit
+      if: ${{ !contains(fromJSON('["false", "0", "no", "off"]'), inputs.phpunit) }}
+      shell: bash
+      env:
+        DRUPAL_ROOT: ${{ steps.build.outputs.drupal_root }}
+        MODULE_DIR: ${{ steps.build.outputs.module_dir }}
+        PHPUNIT_ARGS: ${{ inputs.phpunit_args }}
+        INPUT_SIMPLETEST_DB: ${{ inputs.simpletest_db }}
+      run: |
+        cd "$DRUPAL_ROOT"
+        SIMPLETEST_DB="${INPUT_SIMPLETEST_DB:-${SIMPLETEST_DB:-}}"
+        if [ -z "$SIMPLETEST_DB" ]; then
+          echo "::notice::No simpletest_db. Unit tests run; Kernel and Functional tests need a database."
+        fi
+        export SIMPLETEST_DB
+        export SIMPLETEST_BASE_URL='http://127.0.0.1:8888'
+        export BROWSERTEST_OUTPUT_DIRECTORY="${DRUPAL_ROOT}/web/sites/simpletest/browser_output"
+        export SYMFONY_DEPRECATIONS_HELPER="${SYMFONY_DEPRECATIONS_HELPER:-weak}"
+
+        # shellcheck disable=SC2086 # phpunit_args is split on purpose.
+        vendor/bin/phpunit -c web/core "$MODULE_DIR" $PHPUNIT_ARGS
+
+    - name: Name the browser output artifact
+      id: artifact
+      if: ${{ failure() && !contains(fromJSON('["false", "0", "no", "off"]'), inputs.phpunit) && steps.build.outputs.drupal_root != '' }}
+      shell: bash
+      env:
+        NAME: ${{ inputs.artifact_name }}
+        DRUPAL: ${{ inputs.drupal }}
+      run: |
+        if [ -z "$NAME" ]; then
+          php_version="$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')"
+          NAME="browser-output-${GITHUB_JOB}-drupal${DRUPAL}-php${php_version}"
+        fi
+        # Keep artifact names to characters every upload backend accepts.
+        echo "name=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-')" >> "$GITHUB_OUTPUT"
+
+    - name: Upload browser output
+      if: ${{ failure() && steps.artifact.outputs.name != '' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: |
+          ${{ steps.build.outputs.drupal_root }}/web/sites/simpletest/browser_output
+          ${{ runner.temp }}/drupal-module-test-server.log
+        if-no-files-found: ignore
+
+    - name: PHPCS
+      if: ${{ !cancelled() && steps.build.outcome == 'success' && !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.phpcs) }}
+      shell: bash
+      env:
+        DRUPAL_ROOT: ${{ steps.build.outputs.drupal_root }}
+        MODULE_DIR: ${{ steps.build.outputs.module_dir }}
+        STANDARD: ${{ inputs.phpcs_standard }}
+        REPORT_ONLY: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.report_only) }}
+      run: |
+        cd "$DRUPAL_ROOT"
+        summary="${RUNNER_TEMP}/drupal-module-test-phpcs-summary.txt"
+        status=0
+        vendor/bin/phpcs \
+          --standard="$STANDARD" \
+          --extensions=php,module,inc,install,test,profile,theme,yml \
+          --ignore='*/node_modules/*,*/vendor/*' \
+          --runtime-set ignore_warnings_on_exit 1 \
+          --no-colors -s \
+          --report-full --report-summary="$summary" \
+          "$MODULE_DIR" || status=$?
+
+        {
+          echo '### PHPCS'
+          echo ''
+          if [ -s "$summary" ]; then
+            echo '```'
+            cat "$summary"
+            echo '```'
+          else
+            echo 'No errors.'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$status" -ne 0 ] && [ "$REPORT_ONLY" = "true" ]; then
+          echo "::warning::PHPCS found errors (report_only, not failing)."
+          exit 0
+        fi
+        exit "$status"
+
+    - name: PHPStan
+      if: ${{ !cancelled() && steps.build.outcome == 'success' && !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.phpstan) }}
+      shell: bash
+      env:
+        DRUPAL_ROOT: ${{ steps.build.outputs.drupal_root }}
+        MODULE_DIR: ${{ steps.build.outputs.module_dir }}
+        LEVEL: ${{ inputs.phpstan_level }}
+        REPORT_ONLY: ${{ !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.report_only) }}
+      run: |
+        case "$LEVEL" in
+          max|[0-9]|10) ;;
+          *) echo "::error::phpstan_level must be 0-10 or max, got '${LEVEL}'."; exit 1 ;;
+        esac
+
+        cd "$DRUPAL_ROOT"
+        # phpstan-drupal finds the Drupal root itself; extensions are
+        # registered by phpstan/extension-installer.
+        printf 'parameters:\n  level: %s\n  paths:\n    - %s\n' "$LEVEL" "$MODULE_DIR" > phpstan-module.neon
+
+        status=0
+        vendor/bin/phpstan analyse -c phpstan-module.neon --no-progress --memory-limit=-1 --error-format=github || status=$?
+
+        if [ "$status" -ne 0 ]; then
+          # Annotations are capped per step; the table lists every error. The
+          # result cache makes this second pass quick.
+          vendor/bin/phpstan analyse -c phpstan-module.neon --no-progress --memory-limit=-1 --error-format=table || true
+          if [ "$REPORT_ONLY" = "true" ]; then
+            echo "::warning::PHPStan found errors (report_only, not failing)."
+            exit 0
+          fi
+        fi
+        exit "$status"

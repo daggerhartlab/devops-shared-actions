@@ -24,6 +24,8 @@ every example below uses.
 - [`drupal-module-version`](#drupal-module-version) — stamps a release
   version and datestamp into a custom Drupal module's `*.info.yml`, creates
   the release tag on the packaging commit, and publishes a GitHub Release.
+- [`drupal-module-test`](#drupal-module-test) — builds a Drupal site around a
+  custom module's checkout and runs its PHPUnit tests, PHPCS and PHPStan.
 - [`wp-plugin-version`](#wp-plugin-version) — stamps a release version into a
   WordPress plugin's header and `readme.txt` Stable tag on its primary branch,
   and pushes the branch with a new release tag on that commit.
@@ -615,6 +617,137 @@ Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`,
   single-module repo wants. Git's pathspec glob crosses directory
   separators, so submodules nested under the path are included either way.
 
+## `drupal-module-test`
+
+Tests a custom Drupal module in its own repository. A module repo has no site
+to test in, so the action builds one: `drupal/recommended-project`, with the
+checkout installed from a symlinked path repository (the same layout as local
+module development), `drupal/core-dev`, and the module's own `require-dev`.
+It then runs the module's tests with core's `phpunit.xml.dist`, and
+optionally PHPCS and PHPStan.
+
+For module repos only. A client site is already a Drupal project and runs its
+own suites after `composer install`; see
+[Running CI tests](#running-ci-tests-phpunit).
+
+```yaml
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  phpunit:
+    name: PHPUnit (Drupal ${{ matrix.drupal }}, PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    # The next-version job reports early breakage without failing the run.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { drupal: '^11',      php: '8.3', stability: stable, experimental: false }
+          - { drupal: '^11',      php: '8.5', stability: stable, experimental: false }
+          - { drupal: '11.x-dev', php: '8.5', stability: dev,    experimental: true }
+    # Composite actions can't declare services, so the database lives here.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: drupal
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+        with:
+          php_version: ${{ matrix.php }}
+          php_extensions: gd, pdo_mysql
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/drupal-module-test@v1
+        with:
+          drupal: ${{ matrix.drupal }}
+          stability: ${{ matrix.stability }}
+          simpletest_db: mysql://root:root@127.0.0.1:3306/drupal
+
+  code-quality:
+    name: Code quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+        with:
+          php_version: '8.3'
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/drupal-module-test@v1
+        with:
+          phpunit: false
+          phpcs: true
+          phpstan: true
+          # Until the module passes both; remove to make them gate merges.
+          report_only: true
+```
+
+Inputs, with defaults: `module_path` (`.`), `drupal` (`^11`), `stability`
+(`stable`), `phpunit` (on), `phpunit_args`, `simpletest_db`, `phpcs` (off),
+`phpcs_standard` (`Drupal,DrupalPractice`), `phpstan` (off), `phpstan_level`
+(`2`), `report_only` (off), `artifact_name`.
+
+Outputs: `drupal_root`, `module_dir` (the module inside the built site),
+`package`. Use them for extra steps against the built site, e.g.
+`working-directory: ${{ steps.test.outputs.drupal_root }}`.
+
+### Gotchas
+
+- **Run `setup-runner` first.** The action uses whatever PHP and Composer are
+  on the runner. Kernel and Functional tests need `pdo_mysql` in
+  `php_extensions`.
+- **Declare test-only dependencies in the module's `require-dev`.** The
+  action installs them; nothing else will. A test that installs a contrib
+  module the module doesn't require (e.g. `paragraphs` for an integration
+  test) fails here even when it passes in a local site that happens to have
+  it.
+- **PHPUnit runs once per job.** It starts PHP's built-in server on
+  `127.0.0.1:8888`, and a second run in the same job is refused rather than
+  tested against the first run's site. PHPCS/PHPStan-only runs can repeat.
+- **Required check names come from your job names.** With a matrix, the
+  values are part of the name (`PHPUnit (Drupal ^11, PHP 8.3)`). Renaming a
+  job or changing a matrix value renames the check, and a required check
+  that never reports blocks every pull request.
+- **Deprecations are reported, not failed.** `SYMFONY_DEPRECATIONS_HELPER`
+  defaults to `weak` unless the job sets it.
+- **A dev constraint needs `stability: dev`**, e.g. `drupal: 11.x-dev`.
+- **`report_only` covers PHPCS and PHPStan, never PHPUnit.** Errors are still
+  listed (PHPCS in the job summary, PHPStan as annotations and in the log)
+  with a warning, and the step passes.
+- **PHPCS warnings never fail the run**, only errors, matching
+  `ignore_warnings_on_exit`.
+- **The Composer cache is shared across runs.** `setup-runner` keys it on
+  `composer.lock`, which a module repo doesn't commit, so every run restores
+  the same entry and it isn't refreshed. It still saves most downloads.
+- **On a PHPUnit failure**, the browser output and web server log are
+  uploaded as an artifact named from the job, Drupal constraint and PHP
+  version, so matrix jobs don't collide. Set `artifact_name` to override.
+
 ## `wp-plugin-version`
 
 Releases a WordPress plugin with its version in place. Git Updater decides
@@ -1088,6 +1221,8 @@ once `v1` is moved onto it.
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
 | `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
+| `drupal-module-test` | Builds a fixture module with one Unit, Kernel and Functional test and a `require-dev` package, runs every check against a MySQL service, asserts the module is loaded through a symlink to the checkout, the `require-dev` package was installed, and all three tests ran and passed |
+| `drupal-module-test-quality` | Builds a fixture module with PHPCS and PHPStan errors, asserts `report_only` passes, PHPCS and PHPStan each fail the run on their own, and a `module_path` without `composer.json` fails |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
 | `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts the dev package is included by default and excluded with `no_dev`, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
 | `composer-diff` | Builds base and changed fixture commits, runs with `dry_run` across three lock files, asserts each is named, the changed tables are present, an unchanged lock collapses to one line, and a new lock shows its packages as new; that an unchanged-only run reports `changed=false`; and that a directory with no lock and a base missing from the checkout both fail |

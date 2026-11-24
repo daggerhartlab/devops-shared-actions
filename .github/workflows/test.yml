@@ -439,6 +439,274 @@ jobs:
             || { echo "::error::fixture clone is not shallow - the assertion below would be meaningless"; exit 1; }
           echo "shallow fixture confirmed; the action's guard reads this same flag"
 
+  drupal-module-test:
+    name: Drupal module test
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: drupal
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # One test of each kind, so the database (Kernel) and the web server
+      # (Functional) are both proven, plus a require-dev package the action
+      # must install. The module is clean under PHPCS and PHPStan level 2.
+      - name: Build a Drupal module fixture
+        run: |
+          mkdir -p dmtfix/tests/src/Unit dmtfix/tests/src/Kernel dmtfix/tests/src/Functional
+          cat > dmtfix/composer.json <<'JSON'
+          {
+            "name": "fixture/dmtfix",
+            "type": "drupal-module",
+            "require-dev": {
+              "psr/clock": "^1.0"
+            }
+          }
+          JSON
+          cat > dmtfix/dmtfix.info.yml <<'INFO'
+          name: 'DMT Fixture'
+          type: module
+          description: 'Fixture for the drupal-module-test action.'
+          core_version_requirement: ^11
+          package: Testing
+          INFO
+          cat > dmtfix/tests/src/Unit/FixtureUnitTest.php <<'PHP'
+          <?php
+
+          declare(strict_types=1);
+
+          namespace Drupal\Tests\dmtfix\Unit;
+
+          use Drupal\Tests\UnitTestCase;
+          use PHPUnit\Framework\Attributes\Group;
+
+          /**
+           * Proves unit tests run.
+           */
+          #[Group('dmtfix')]
+          final class FixtureUnitTest extends UnitTestCase {
+
+            /**
+             * Tests that unit tests run.
+             */
+            public function testRuns(): void {
+              $this->assertSame(2, 1 + 1);
+            }
+
+          }
+          PHP
+          cat > dmtfix/tests/src/Kernel/FixtureKernelTest.php <<'PHP'
+          <?php
+
+          declare(strict_types=1);
+
+          namespace Drupal\Tests\dmtfix\Kernel;
+
+          use Drupal\KernelTests\KernelTestBase;
+          use PHPUnit\Framework\Attributes\Group;
+
+          /**
+           * Proves kernel tests reach the database.
+           */
+          #[Group('dmtfix')]
+          final class FixtureKernelTest extends KernelTestBase {
+
+            /**
+             * {@inheritdoc}
+             */
+            protected static $modules = ['system', 'user', 'dmtfix'];
+
+            /**
+             * Tests that the module is enabled and a schema can be installed.
+             */
+            public function testModuleEnabled(): void {
+              $this->installEntitySchema('user');
+              $this->assertTrue($this->container->get('module_handler')->moduleExists('dmtfix'));
+            }
+
+          }
+          PHP
+          cat > dmtfix/tests/src/Functional/FixtureFunctionalTest.php <<'PHP'
+          <?php
+
+          declare(strict_types=1);
+
+          namespace Drupal\Tests\dmtfix\Functional;
+
+          use Drupal\Tests\BrowserTestBase;
+          use PHPUnit\Framework\Attributes\Group;
+
+          /**
+           * Proves functional tests reach the web server.
+           */
+          #[Group('dmtfix')]
+          final class FixtureFunctionalTest extends BrowserTestBase {
+
+            /**
+             * {@inheritdoc}
+             */
+            protected static $modules = ['dmtfix'];
+
+            /**
+             * {@inheritdoc}
+             */
+            protected $defaultTheme = 'stark';
+
+            /**
+             * Tests that the login page loads.
+             */
+            public function testLoginPage(): void {
+              $this->drupalGet('user/login');
+              $this->assertSession()->statusCodeEquals(200);
+            }
+
+          }
+          PHP
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: '8.3'
+          php_extensions: gd, pdo_mysql
+
+      - name: Run drupal-module-test (clean module, every check)
+        id: clean
+        uses: ./.github/actions/drupal-module-test
+        with:
+          module_path: dmtfix
+          simpletest_db: mysql://root:root@127.0.0.1:3306/drupal
+          phpunit_args: --log-junit ${{ runner.temp }}/dmtfix-junit.xml
+          phpcs: 'true'
+          phpstan: 'true'
+
+      - name: Assert the clean run
+        env:
+          DRUPAL_ROOT: ${{ steps.clean.outputs.drupal_root }}
+          MODULE_DIR: ${{ steps.clean.outputs.module_dir }}
+          PACKAGE: ${{ steps.clean.outputs.package }}
+          JUNIT: ${{ runner.temp }}/dmtfix-junit.xml
+        run: |
+          fail=0
+          [ "$PACKAGE" = "fixture/dmtfix" ] || { echo "::error::expected package=fixture/dmtfix, got '$PACKAGE'"; fail=1; }
+
+          # Drupal must load the module through the path repository's symlink.
+          case "$MODULE_DIR" in
+            "$DRUPAL_ROOT"/web/modules/contrib/dmtfix) ;;
+            *) echo "::error::module_dir '$MODULE_DIR' is not web/modules/contrib/dmtfix in '$DRUPAL_ROOT'"; fail=1 ;;
+          esac
+          [ -L "$MODULE_DIR" ] || { echo "::error::module_dir is not a symlink"; fail=1; }
+          [ "$(cd "$MODULE_DIR" && pwd -P)" = "$GITHUB_WORKSPACE/dmtfix" ] \
+            || { echo "::error::module_dir does not resolve to the checkout"; fail=1; }
+
+          # A dependency's require-dev is never installed by Composer; the action must.
+          [ -d "$DRUPAL_ROOT/vendor/psr/clock" ] || { echo "::error::the module's require-dev was not installed"; fail=1; }
+
+          # All three tests ran - a run that discovers nothing also exits 0.
+          summary="$(grep -o '<testsuite [^>]*>' "$JUNIT" | head -1)"
+          echo "junit: $summary"
+          case "$summary" in
+            *' tests="3" '*' errors="0" failures="0"'*) ;;
+            *) echo "::error::expected 3 passing tests"; fail=1 ;;
+          esac
+          exit "$fail"
+
+  drupal-module-test-quality:
+    name: Drupal module test (quality checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # One PHPCS violation set and one PHPStan error, so each check's failure
+      # is asserted on its own rather than masked by the other.
+      - name: Build a Drupal module fixture with errors
+        run: |
+          mkdir -p dmtfix/src
+          cat > dmtfix/composer.json <<'JSON'
+          {
+            "name": "fixture/dmtfix",
+            "type": "drupal-module"
+          }
+          JSON
+          cat > dmtfix/dmtfix.info.yml <<'INFO'
+          name: 'DMT Fixture'
+          type: module
+          core_version_requirement: ^11
+          INFO
+          cat > dmtfix/src/Broken.php <<'PHP'
+          <?php
+
+          namespace Drupal\dmtfix;
+
+          class Broken {
+              public function run() {
+                  return dmtfix_undefined_function();
+              }
+          }
+          PHP
+
+      - uses: ./.github/actions/setup-runner
+        with:
+          php_version: '8.3'
+
+      - name: Run drupal-module-test (report only)
+        id: report
+        uses: ./.github/actions/drupal-module-test
+        with:
+          module_path: dmtfix
+          phpunit: 'false'
+          phpcs: 'true'
+          phpstan: 'true'
+          report_only: 'true'
+
+      - name: Run drupal-module-test (PHPCS errors fail)
+        id: phpcs
+        continue-on-error: true
+        uses: ./.github/actions/drupal-module-test
+        with:
+          module_path: dmtfix
+          phpunit: 'false'
+          phpcs: 'true'
+
+      - name: Run drupal-module-test (PHPStan errors fail)
+        id: phpstan
+        continue-on-error: true
+        uses: ./.github/actions/drupal-module-test
+        with:
+          module_path: dmtfix
+          phpunit: 'false'
+          phpstan: 'true'
+
+      - name: Run drupal-module-test (no composer.json)
+        id: missing
+        continue-on-error: true
+        uses: ./.github/actions/drupal-module-test
+        with:
+          module_path: does-not-exist
+          phpunit: 'false'
+
+      - name: Assert the outcomes
+        env:
+          REPORT: ${{ steps.report.outcome }}
+          PHPCS: ${{ steps.phpcs.outcome }}
+          PHPSTAN: ${{ steps.phpstan.outcome }}
+          MISSING: ${{ steps.missing.outcome }}
+        run: |
+          fail=0
+          [ "$REPORT" = "success" ]  || { echo "::error::report_only run should succeed, got '$REPORT'"; fail=1; }
+          [ "$PHPCS" = "failure" ]   || { echo "::error::PHPCS errors should fail the run, got '$PHPCS'"; fail=1; }
+          [ "$PHPSTAN" = "failure" ] || { echo "::error::PHPStan errors should fail the run, got '$PHPSTAN'"; fail=1; }
+          [ "$MISSING" = "failure" ] || { echo "::error::a module_path without composer.json should fail, got '$MISSING'"; fail=1; }
+          exit "$fail"
+
   wp-plugin-version:
     name: WP plugin version
     runs-on: ubuntu-latest
