@@ -59,6 +59,9 @@ composer config repositories.module "$(php -r '
 ' "$source_dir")"
 
 composer require --no-update "${package}:*@dev"
+# The template allows any later minor, which --with-all-dependencies would
+# install; pin core to the requested constraint.
+composer require --no-update "drupal/core-recommended:${DRUPAL}"
 composer require --dev --no-update "drupal/core-dev:${DRUPAL}"
 read_module require-dev | xargs -r composer require --dev --no-update
 

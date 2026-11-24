@@ -735,6 +735,10 @@ Outputs: `drupal_root`, `module_dir` (the module inside the built site),
   that never reports blocks every pull request.
 - **Deprecations are reported, not failed.** `SYMFONY_DEPRECATIONS_HELPER`
   defaults to `weak` unless the job sets it.
+- **`drupal` pins core, not just the template.** The constraint is applied
+  to `drupal/core-recommended` and `drupal/core-dev` as well, so
+  `drupal: '~11.3.0'` tests 11.3 rather than the latest minor the template
+  allows. Use it to test the lowest minor a module supports.
 - **A dev constraint needs `stability: dev`**, e.g. `drupal: 11.x-dev`.
 - **`report_only` covers PHPCS and PHPStan, never PHPUnit.** Errors are still
   listed (PHPCS in the job summary, PHPStan as annotations and in the log)

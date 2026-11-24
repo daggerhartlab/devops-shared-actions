@@ -20,7 +20,7 @@ inputs:
     required: false
     default: '.'
   drupal:
-    description: "Composer constraint for drupal/recommended-project and drupal/core-dev, e.g. '^11' or '11.x-dev'."
+    description: "Composer constraint for drupal/recommended-project, drupal/core-recommended and drupal/core-dev, e.g. '^11', '~11.3.0' or '11.x-dev'."
     required: false
     default: '^11'
   stability:
