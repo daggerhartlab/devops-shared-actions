@@ -580,7 +580,7 @@ Pass `release: false` to stop at the tag. A version containing a hyphen, such
 as `1.3.0-beta1`, is published as a pre-release.
 
 Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`,
-`release_url`.
+`previous_tag`, `release_url`.
 
 ### Gotchas
 
@@ -611,7 +611,12 @@ Outputs: `stamped`, `version`, `tag`, `datestamp`, `files`, `commit`,
   unaffected either way.
 - **Release notes list pull requests merged since the previous release.**
   Commits pushed straight to the branch only show up in the "Full Changelog"
-  compare link.
+  compare link. The previous release is the highest earlier version tag
+  with the same `v` convention (a stable release skips pre-releases), and is
+  passed to GitHub explicitly as `previous_tag`. GitHub can't work it out
+  itself: it looks for the last tag in the new tag's history, and each
+  release tag sits on its own packaging commit, which is never in the next
+  release's history.
 - **`module_path` is for repos holding more than one module.** Left unset,
   every tracked `*.info.yml` in the repo is stamped, which is what a
   single-module repo wants. Git's pathspec glob crosses directory
@@ -1224,7 +1229,7 @@ once `v1` is moved onto it.
 | `all-tools` | Everything enabled at once; asserts each binary landed, git identity was set, and `wp_cli_version` was honored |
 | `minimal` | `php_version: ''` and `node_version: ''` — confirms the documented "pass empty to skip" actually works |
 | `wp-core-update` | Builds an out-of-date WordPress fixture, runs the action with `dry_run`, asserts the update path, that `wp-content` is untouched, and that a re-run is a clean no-op |
-| `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, and that an existing tag, a missing version, and a non-version tag are all refused |
+| `drupal-module-version` | Builds a two-module fixture (one nested), runs the action with `dry_run`, asserts the stamp lands once per file with no `project` key and the tag is created on the packaging commit without being pushed or released, that an already-stamped commit is tagged without a new commit (and a `v` prefix stays in the tag only), that a changed version replaces rather than accumulates, that an existing tag, a missing version, and a non-version tag are all refused, and that `previous_tag` skips pre-releases for a stable release, orders a pre-release after its stable, compares numerically, keeps to the tag's `v` convention while ignoring a moving `v8` tag, and is empty when there is no earlier version tag |
 | `drupal-module-test` | Builds a fixture module with one Unit, Kernel and Functional test and a `require-dev` package, runs every check against a MySQL service, asserts the module is loaded through a symlink to the checkout, the `require-dev` package was installed, and all three tests ran and passed |
 | `drupal-module-test-quality` | Builds a fixture module with PHPCS and PHPStan errors, asserts `report_only` passes, PHPCS and PHPStan each fail the run on their own, and a `module_path` without `composer.json` fails |
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
