@@ -428,6 +428,71 @@ jobs:
             || { echo "::error::tag 9.9.9 was moved"; fail=1; }
           exit "$fail"
 
+      # Earlier releases for previous_tag to choose from. Each release tag sits
+      # on its own packaging commit, so only the tag names matter here. This
+      # repo's own v1.* tags and the moving v1 tag stay in play as noise.
+      - name: Add earlier release tags
+        run: |
+          for t in 8.0.0 8.1.0-rc1 8.9.0 v8 v8.0.0; do
+            git tag "$t"
+          done
+
+      - name: Run drupal-module-version (stable skips pre-releases)
+        id: prev_stable
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '8.1.0'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Run drupal-module-version (pre-release after a stable)
+        id: prev_pre
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '8.2.0-rc1'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Run drupal-module-version (numeric, not lexical, order)
+        id: prev_numeric
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '8.10.0'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Run drupal-module-version (v-prefixed)
+        id: prev_v
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: 'v8.1.0'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Run drupal-module-version (no earlier version tag)
+        id: prev_first
+        uses: ./.github/actions/drupal-module-version
+        with:
+          version: '7.0.0'
+          module_path: modfix
+          dry_run: 'true'
+
+      - name: Assert the previous release tags
+        env:
+          STABLE: ${{ steps.prev_stable.outputs.previous_tag }}
+          PRE: ${{ steps.prev_pre.outputs.previous_tag }}
+          NUMERIC: ${{ steps.prev_numeric.outputs.previous_tag }}
+          V: ${{ steps.prev_v.outputs.previous_tag }}
+          FIRST: ${{ steps.prev_first.outputs.previous_tag }}
+        run: |
+          fail=0
+          [ "$STABLE" = "8.0.0" ]  || { echo "::error::8.1.0 should start from 8.0.0, skipping 8.1.0-rc1; got '$STABLE'"; fail=1; }
+          [ "$PRE" = "8.1.0" ]     || { echo "::error::8.2.0-rc1 should start from 8.1.0, which sorts after 8.1.0-rc1; got '$PRE'"; fail=1; }
+          [ "$NUMERIC" = "8.9.0" ] || { echo "::error::8.10.0 should start from 8.9.0, skipping 8.2.0-rc1; got '$NUMERIC'"; fail=1; }
+          [ "$V" = "v8.0.0" ]      || { echo "::error::v8.1.0 should start from v8.0.0, skipping v8 and unprefixed tags; got '$V'"; fail=1; }
+          [ -z "$FIRST" ]          || { echo "::error::7.0.0 has no earlier version tag; got '$FIRST'"; fail=1; }
+          exit "$fail"
+
       # The shallow-checkout guard is the most likely consumer mistake, so
       # assert it fires rather than trusting it.
       - name: Assert the shallow-checkout guard fires
