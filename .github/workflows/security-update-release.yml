@@ -223,7 +223,7 @@ jobs:
 
       - name: 'Slack: also ships'
         if: steps.also.outputs.total > 0
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -236,7 +236,7 @@ jobs:
             Releasing with ${{ steps.also.outputs.total }} other commit(s) not on live yet (${{ steps.also.outputs.site }} affecting the site).${{ steps.also.outputs.site > 0 && ' The test gate will ask before live.' || '' }} <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
       - name: Slack
         if: steps.find.outputs.dev_only_stop == 'true'
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -264,7 +264,7 @@ jobs:
           sparse-checkout: ${{ inputs.smoke_test_config }}
           sparse-checkout-cone-mode: false
       - id: smoke
-        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
         with:
           environment: dev
           mode: check
@@ -284,7 +284,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Slack
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -384,7 +384,7 @@ jobs:
           sparse-checkout: ${{ inputs.smoke_test_config }}
           sparse-checkout-cone-mode: false
       - id: smoke
-        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
         with:
           environment: test
           mode: check
@@ -404,7 +404,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Slack
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -449,7 +449,7 @@ jobs:
           sparse-checkout: ${{ inputs.smoke_test_config }}
           sparse-checkout-cone-mode: false
       - id: smoke
-        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
         with:
           environment: live
           mode: baseline
@@ -528,7 +528,7 @@ jobs:
           sparse-checkout: ${{ inputs.smoke_test_config }}
           sparse-checkout-cone-mode: false
       - id: smoke
-        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
         with:
           environment: live
           mode: compare
@@ -548,7 +548,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Slack
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -652,7 +652,7 @@ jobs:
 
 
       - name: Slack
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -690,7 +690,7 @@ jobs:
     steps:
       - name: Build the client email
         id: email
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@v1
         with:
           notify_config: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
           email_config: ${{ vars.SECURITY_UPDATE_EMAIL }}
@@ -701,7 +701,7 @@ jobs:
           send: 'false'
       - name: 'Slack: approval needed'
         if: needs.resolve.outputs.notify_client == 'always-ask'
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -722,7 +722,7 @@ jobs:
     steps:
       - name: Send the client email
         id: email
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@v1
         with:
           notify_config: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
           email_config: ${{ vars.SECURITY_UPDATE_EMAIL }}
@@ -735,7 +735,7 @@ jobs:
           mailgun_domain: ${{ vars.MAILGUN_DOMAIN }}
           mailgun_api_base: ${{ vars.MAILGUN_API_BASE }}
       - name: 'Slack: sent'
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -748,7 +748,7 @@ jobs:
             :email: Client email sent to ${{ steps.email.outputs.recipients }} recipient(s): _${{ steps.email.outputs.subject }}_.
       - name: 'Slack: not sent'
         if: failure()
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -768,7 +768,7 @@ jobs:
     steps:
       - name: Send the client email
         id: email
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@v1
         with:
           notify_config: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
           email_config: ${{ vars.SECURITY_UPDATE_EMAIL }}
@@ -781,7 +781,7 @@ jobs:
           mailgun_domain: ${{ vars.MAILGUN_DOMAIN }}
           mailgun_api_base: ${{ vars.MAILGUN_API_BASE }}
       - name: 'Slack: sent'
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
@@ -794,7 +794,7 @@ jobs:
             :email: Client email sent to ${{ steps.email.outputs.recipients }} recipient(s): _${{ steps.email.outputs.subject }}_.
       - name: 'Slack: not sent'
         if: failure()
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
