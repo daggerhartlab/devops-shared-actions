@@ -1,0 +1,138 @@
+name: 'Website smoke test'
+description: >-
+  Checks one environment of a site with Playwright and the runner's Chrome:
+  status, content, required elements, PHP errors, console errors, failed
+  first-party requests, and (in baseline and compare modes) screenshots. The
+  site describes its environments and pages in a YAML config file.
+
+inputs:
+  environment:
+    description: 'Environment key from the config file (e.g. dev, test, live)'
+    required: true
+  mode:
+    description: >-
+      check: page checks only. baseline: checks, then saves screenshots as an
+      artifact. compare: checks, then compares screenshots against the
+      baseline artifact saved earlier in the same workflow run.
+    required: false
+    default: 'check'
+  config:
+    description: 'Path to the config file, relative to the workspace'
+    required: false
+    default: '.github/website-smoke-test.yml'
+  fail_on_failure:
+    description: "'true' fails the step when the smoke test fails; otherwise only the result output says so"
+    required: false
+    default: 'true'
+  basic_auth_user:
+    description: 'HTTP basic auth user, sent only when the server answers 401'
+    required: false
+    default: ''
+  basic_auth_password:
+    description: 'HTTP basic auth password'
+    required: false
+    default: ''
+
+outputs:
+  result:
+    description: 'passed or failed'
+    value: ${{ steps.run.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$GITHUB_WORKSPACE/$CONFIG" ]; then
+          echo "::error::Smoke test config '$CONFIG' not found. Check out the repository first."
+          exit 1
+        fi
+        # Work on a copy, so the action's own folder stays untouched.
+        dir="$RUNNER_TEMP/website-smoke-test"
+        rm -rf "$dir"
+        cp -R "$GITHUB_ACTION_PATH/." "$dir"
+        cd "$dir"
+        google-chrome --version
+        npm ci --no-audit --no-fund
+        {
+          echo "SMOKE_DIR=$dir"
+          echo "SMOKE_CONFIG=$GITHUB_WORKSPACE/$CONFIG"
+          echo "SMOKE_SNAPSHOT_DIR=$RUNNER_TEMP/website-smoke-test-snapshots"
+        } >> "$GITHUB_ENV"
+
+    - name: Download baseline screenshots
+      if: inputs.mode == 'compare'
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: website-smoke-test-snapshots-${{ inputs.environment }}
+        path: ${{ runner.temp }}/website-smoke-test-snapshots
+
+    - name: Smoke test ${{ inputs.environment }} (${{ inputs.mode }})
+      id: run
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        SMOKE_ENVIRONMENT: ${{ inputs.environment }}
+        SMOKE_CACHE_BUST: ${{ github.run_id }}-${{ github.run_attempt }}
+        BASIC_AUTH_USER: ${{ inputs.basic_auth_user }}
+        BASIC_AUTH_PASSWORD: ${{ inputs.basic_auth_password }}
+      run: |
+        cd "$SMOKE_DIR"
+        args=()
+        case "$MODE" in
+          check) export SMOKE_VISUAL=off ;;
+          baseline) args+=(--update-snapshots=all) ;;
+          compare) ;;
+          *) echo "::error::Unknown mode '$MODE'; use check, baseline or compare."; exit 1 ;;
+        esac
+        if npx playwright test "${args[@]}"; then
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+        else
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload baseline screenshots
+      if: inputs.mode == 'baseline' && steps.run.outputs.result == 'passed'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: website-smoke-test-snapshots-${{ inputs.environment }}
+        path: ${{ runner.temp }}/website-smoke-test-snapshots/
+        overwrite: true
+
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: website-smoke-test-report-${{ inputs.environment }}-${{ inputs.mode }}
+        path: |
+          ${{ runner.temp }}/website-smoke-test/report/
+          ${{ runner.temp }}/website-smoke-test/test-results/
+        if-no-files-found: ignore
+        overwrite: true
+
+    - name: Summary
+      if: always()
+      shell: bash
+      env:
+        RESULT: ${{ steps.run.outputs.result }}
+        MODE: ${{ inputs.mode }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        {
+          echo "### Website smoke test: ${ENVIRONMENT} (${MODE})"
+          echo ""
+          echo "Result: **${RESULT:-error}**. The HTML report and any failure screenshots and traces are in the run's \`website-smoke-test-report-${ENVIRONMENT}-${MODE}\` artifact."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Fail on smoke test failure
+      if: steps.run.outputs.result != 'passed' && !contains(fromJSON('["", "false", "0", "no", "off"]'), inputs.fail_on_failure)
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        echo "::error::Website smoke test failed for ${ENVIRONMENT}."
+        exit 1
