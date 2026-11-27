@@ -1318,8 +1318,12 @@ jobs:
         run: |
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
+          # With the step's own shell options: no shell: means bash -e, without
+          # pipefail.
           ruby -ryaml -e '
-            puts YAML.load_file(".github/workflows/claude-review-github-issues.yml")["jobs"]["issues"]["steps"].find { |s| s["id"] == "fetch" }["run"]
+            step = YAML.load_file(".github/workflows/claude-review-github-issues.yml")["jobs"]["issues"]["steps"].find { |s| s["id"] == "fetch" }
+            puts(step["shell"] == "bash" ? "set -eo pipefail" : "set -e")
+            puts step["run"]
           ' > "$RUNNER_TEMP/fetch.sh"
           # shellcheck disable=SC2016
           printf '%s\n' '#!/bin/sh' '[ -n "$FIXTURE" ] || exit 1' 'cat "$FIXTURE"' > "$bin/gh"
@@ -1331,7 +1335,7 @@ jobs:
             : > "$RUNNER_TEMP/out"
             FIXTURE="$1" PATH="$bin:$PATH" REPO=acme/mod PR=7 \
               GITHUB_OUTPUT="$RUNNER_TEMP/out" GITHUB_STEP_SUMMARY=/dev/null \
-              bash -eo pipefail "$RUNNER_TEMP/fetch.sh" > "$RUNNER_TEMP/log" 2>&1
+              bash "$RUNNER_TEMP/fetch.sh" > "$RUNNER_TEMP/log" 2>&1
           }
           wrap() {
             jq -n --argjson nodes "$1" --argjson total "$2" \
@@ -1386,5 +1390,11 @@ jobs:
           run_fetch "" || { echo "::error::failed request: step failed instead of warning"; fail=1; }
           [ ! -s "$md" ] || { echo "::error::failed request: expected no outputs"; fail=1; }
           grep -qF '::warning::' "$RUNNER_TEMP/log" || { echo "::error::failed request: no warning"; fail=1; }
+
+          # A response jq can't render: a warning, not a silent "no issues".
+          echo '{"data": {"repository": {"pullRequest": {"closingIssuesReferences": null}}}}' > "$RUNNER_TEMP/bad.json"
+          run_fetch "$RUNNER_TEMP/bad.json" || { echo "::error::bad response: step failed instead of warning"; fail=1; }
+          [ ! -s "$md" ] || { echo "::error::bad response: expected no outputs"; fail=1; }
+          grep -qF '::warning::' "$RUNNER_TEMP/log" || { echo "::error::bad response: no warning"; fail=1; }
 
           exit "$fail"

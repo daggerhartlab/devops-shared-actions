@@ -224,6 +224,8 @@ jobs:
       - name: Fetch the Jira ticket
         id: jira
         if: steps.diff.outputs.files != '0'
+        # pipefail, so a failed jq reaches skip().
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

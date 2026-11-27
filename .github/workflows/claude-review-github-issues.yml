@@ -84,6 +84,8 @@ jobs:
       # five issues, in this repository.
       - name: Fetch the linked issues
         id: fetch
+        # pipefail, so a failed jq reaches skip().
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
