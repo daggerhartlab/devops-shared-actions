@@ -1402,6 +1402,10 @@ jobs:
   website-smoke-test:
     name: Website smoke test
     runs-on: ubuntu-latest
+    # Read: waits for the baseline artifact to be listed.
+    permissions:
+      actions: read
+      contents: read
     env:
       # A failing page fails once instead of three times.
       SMOKE_RETRIES: '0'
@@ -1463,6 +1467,20 @@ jobs:
           environment: local
           mode: baseline
           config: smokefix/website-smoke-test.yml
+
+      # A just-uploaded artifact can take a few seconds to be listed; in real
+      # use, compare runs in a later job.
+      - name: Wait for the baseline artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 30); do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              --jq '.artifacts[].name' | grep -qx website-smoke-test-snapshots-local && exit 0
+            sleep 2
+          done
+          echo "::error::baseline artifact never listed"
+          exit 1
 
       - name: Run website-smoke-test (compare)
         id: compare
