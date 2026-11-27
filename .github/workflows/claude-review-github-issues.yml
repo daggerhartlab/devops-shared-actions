@@ -177,7 +177,7 @@ jobs:
       contents: read
       pull-requests: write
     # Pinned: inside a called workflow, ./ is the caller's repo.
-    uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review.yml@v1
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review.yml@claude-review-github-issues
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
