@@ -1279,3 +1279,112 @@ jobs:
           [ "$MISSING_OUTCOME" = "failure" ] || { echo "::error::a directory with no lock on either side should fail, got '$MISSING_OUTCOME'"; fail=1; }
           [ "$NOBASE_OUTCOME" = "failure" ]  || { echo "::error::a base missing from the checkout should fail, got '$NOBASE_OUTCOME'"; fail=1; }
           exit "$fail"
+
+  claude-review-github-issues:
+    name: claude-review GitHub issues wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The wrapper is pass-through only, so a core input or secret it doesn't
+      # declare and pass on would be silently unavailable to its callers.
+      - name: Wrapper mirrors claude-review.yml
+        run: |
+          ruby -ryaml -e '
+            core = YAML.load_file(".github/workflows/claude-review.yml")
+            wrap = YAML.load_file(".github/workflows/claude-review-github-issues.yml")
+            # Psych reads the "on" key as true.
+            call = ->(d) { (d["on"] || d[true])["workflow_call"] }
+            inputs = call[core]["inputs"]
+            secrets = call[core]["secrets"]
+            review = wrap["jobs"]["review"]
+            # Split so GitHub does not evaluate it as an expression here.
+            expr = ->(e) { "$" + "{{ #{e} }}" }
+            errors = []
+            errors << "inputs differ from claude-review.yml (minus github_issues)" unless call[wrap]["inputs"] == inputs.reject { |k, _| k == "github_issues" }
+            errors << "secrets differ from claude-review.yml" unless call[wrap]["secrets"] == secrets
+            want = inputs.keys.to_h { |k| [k, expr["inputs.#{k}"]] }
+            want["github_issues"] = expr["needs.issues.outputs.markdown"]
+            errors << "review job with: is not a pass-through of every input" unless review["with"] == want
+            errors << "review job secrets: is not a pass-through of every secret" unless review["secrets"] == secrets.keys.to_h { |k| [k, expr["secrets.#{k}"]] }
+            errors << "issues job if: differs from the review job in claude-review.yml" unless wrap["jobs"]["issues"]["if"] == core["jobs"]["review"]["if"]
+            abort errors.map { |e| "::error::#{e}" }.join("\n") unless errors.empty?
+            puts "wrapper mirrors #{inputs.size - 1} inputs and #{secrets.size} secrets"
+          '
+
+      # Runs the wrapper's fetch step against fixture GraphQL responses, with
+      # a stand-in gh on PATH.
+      - name: Render linked issues
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          ruby -ryaml -e '
+            puts YAML.load_file(".github/workflows/claude-review-github-issues.yml")["jobs"]["issues"]["steps"].find { |s| s["id"] == "fetch" }["run"]
+          ' > "$RUNNER_TEMP/fetch.sh"
+          # shellcheck disable=SC2016
+          printf '%s\n' '#!/bin/sh' '[ -n "$FIXTURE" ] || exit 1' 'cat "$FIXTURE"' > "$bin/gh"
+          chmod +x "$bin/gh"
+
+          # $1: fixture file, or empty for a failed request. Leaves the step's
+          # outputs in $RUNNER_TEMP/out and its log in $RUNNER_TEMP/log.
+          run_fetch() {
+            : > "$RUNNER_TEMP/out"
+            FIXTURE="$1" PATH="$bin:$PATH" REPO=acme/mod PR=7 \
+              GITHUB_OUTPUT="$RUNNER_TEMP/out" GITHUB_STEP_SUMMARY=/dev/null \
+              bash -eo pipefail "$RUNNER_TEMP/fetch.sh" > "$RUNNER_TEMP/log" 2>&1
+          }
+          wrap() {
+            jq -n --argjson nodes "$1" --argjson total "$2" \
+              '{data: {repository: {pullRequest: {closingIssuesReferences: {totalCount: $total, nodes: $nodes}}}}}'
+          }
+          md="$RUNNER_TEMP/out"
+          fail=0
+          has() { grep -qF -- "$1" "$md" || { echo "::error::$2: missing '$1'"; fail=1; }; }
+
+          # Two issues here, one in another repository. The first has a
+          # milestone and a same-repo parent; the second a cross-repo parent
+          # and more comments than were fetched.
+          wrap '[
+            {"number": 12, "title": "Export drops aliases", "state": "OPEN", "body": "Aliases vanish on export.",
+             "repository": {"nameWithOwner": "acme/mod"},
+             "milestone": {"title": "2.3.x", "description": "Path handling fixes.", "dueOn": "2026-12-01T00:00:00Z"},
+             "parent": {"number": 10, "title": "Path epic", "body": "All path work.", "repository": {"nameWithOwner": "acme/mod"}},
+             "comments": {"totalCount": 1, "nodes": [{"author": {"login": "dev"}, "createdAt": "2026-11-20T10:00:00Z", "body": "Confirmed on 11.2."}]}},
+            {"number": 13, "title": "Import rename", "state": "CLOSED", "body": "",
+             "repository": {"nameWithOwner": "acme/mod"}, "milestone": null,
+             "parent": {"number": 5, "title": "Roadmap", "body": "", "repository": {"nameWithOwner": "acme/other"}},
+             "comments": {"totalCount": 25, "nodes": [{"author": null, "createdAt": "2026-11-21T10:00:00Z", "body": "Late reply."}]}},
+            {"number": 3, "title": "Elsewhere", "state": "OPEN", "body": "x",
+             "repository": {"nameWithOwner": "acme/other"}, "milestone": null, "parent": null,
+             "comments": {"totalCount": 0, "nodes": []}}
+          ]' 3 > "$RUNNER_TEMP/linked.json"
+          run_fetch "$RUNNER_TEMP/linked.json" || { echo "::error::linked issues: step failed"; cat "$RUNNER_TEMP/log"; fail=1; }
+          has 'numbers=#12 #13' 'linked issues'
+          has '(1 linked issue(s) not included' 'linked issues'
+          has '# #12: Export drops aliases' 'linked issues'
+          has 'State: OPEN. Milestone: 2.3.x, due 2026-12-01. Parent: #10 Path epic.' 'linked issues'
+          has '## Milestone 2.3.x' 'linked issues'
+          has '## Parent issue #10: Path epic' 'linked issues'
+          has '### dev, 2026-11-20' 'linked issues'
+          has 'Parent: acme/other#5 Roadmap.' 'linked issues'
+          has '(24 older comment(s) not included.)' 'linked issues'
+          has '### ghost, 2026-11-21' 'linked issues'
+          grep -qF '# #3: Elsewhere' "$md" && { echo "::error::linked issues: included an issue from another repository"; fail=1; }
+
+          # An oversized issue is cut to the budget.
+          wrap "$(jq -n '[{number: 1, title: "Big", state: "OPEN", body: ("x" * 50000),
+            repository: {nameWithOwner: "acme/mod"}, milestone: null, parent: null,
+            comments: {totalCount: 0, nodes: []}}]')" 1 > "$RUNNER_TEMP/big.json"
+          run_fetch "$RUNNER_TEMP/big.json" || { echo "::error::oversized issue: step failed"; fail=1; }
+          has '[Truncated.]' 'oversized issue'
+          [ "$(wc -c < "$md")" -lt 41000 ] || { echo "::error::oversized issue: output not cut to the budget"; fail=1; }
+
+          # No linked issues, or a failed request: success with no output.
+          wrap '[]' 0 > "$RUNNER_TEMP/none.json"
+          run_fetch "$RUNNER_TEMP/none.json" || { echo "::error::no issues: step failed"; fail=1; }
+          [ ! -s "$md" ] || { echo "::error::no issues: expected no outputs"; cat "$md"; fail=1; }
+          run_fetch "" || { echo "::error::failed request: step failed instead of warning"; fail=1; }
+          [ ! -s "$md" ] || { echo "::error::failed request: expected no outputs"; fail=1; }
+          grep -qF '::warning::' "$RUNNER_TEMP/log" || { echo "::error::failed request: no warning"; fail=1; }
+
+          exit "$fail"
