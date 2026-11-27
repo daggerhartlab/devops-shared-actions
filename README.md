@@ -1476,9 +1476,10 @@ jobs:
 name: 'Security update: sweep'
 
 on:
-  # Acts weekdays 7 AM to 7 PM US Eastern; this covers both UTC offsets.
+  # Acts weekdays at 7 AM, 11 AM and 3 PM US Eastern (act_hours); each hour
+  # is scheduled at both of its UTC offsets, and the other run skips.
   schedule:
-    - cron: '0 0,11-23 * * *'
+    - cron: '0 11,12,15,16,19,20 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -1536,8 +1537,9 @@ block lists what it takes.
 Inputs, beyond those shown: `security-update.yml` takes `php_version`
 (default `8.3`); `security-update-release.yml` takes `smoke_test_config`
 (default `.github/website-smoke-test.yml`); `security-update-sweep.yml` takes
-`pr_checks_stuck_after` (seconds, default `7200`) and
-`approval_waiting_after` (default `14400`).
+`pr_checks_stuck_after` (seconds, default `7200`), `approval_waiting_after`
+(default `14400`) and `act_hours` (US Eastern hours, default `7 11 15`; change
+the caller's schedule to match).
 
 ### Organization setup (once)
 

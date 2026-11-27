@@ -8,9 +8,11 @@ name: 'Security update: sweep'
 #   for longer than approval_waiting_after seconds.
 # At most one nudge per item per day. Changes nothing else.
 #
-# Scheduled runs act only on weekdays 7 AM to 7 PM US Eastern; the caller's
-# schedule should cover that range in UTC (daylight saving) and include 7 AM,
-# which catches anything that stalled overnight. Manual runs skip the window.
+# Scheduled runs act only on weekdays, at the US Eastern hours in act_hours.
+# Schedules are UTC, so the caller schedules each hour at both of its UTC
+# offsets (daylight saving), and the run that isn't at an act hour skips.
+# The first hour catches anything that stalled overnight. Manual runs always
+# act.
 
 on:
   workflow_call:
@@ -31,6 +33,10 @@ on:
         description: 'Seconds an approval gate may wait before a nudge'
         type: number
         default: 14400
+      act_hours:
+        description: 'US Eastern hours (0-23, space-separated) when scheduled runs act, on weekdays'
+        type: string
+        default: '7 11 15'
     secrets:
       LABBY_SLACK_BOT_TOKEN:
         required: false
@@ -56,16 +62,18 @@ jobs:
     outputs:
       items: ${{ steps.find.outputs.items }}
     steps:
-      - name: Within working hours
+      - name: At an act hour
         id: window
         if: github.event_name == 'schedule'
+        env:
+          ACT_HOURS: ${{ inputs.act_hours }}
         run: |
           day=$(TZ=America/New_York date +%u)
           hour=$(TZ=America/New_York date +%-H)
-          if [ "$day" -le 5 ] && [ "$hour" -ge 7 ] && [ "$hour" -le 19 ]; then
+          if [ "$day" -le 5 ] && [[ " ${ACT_HOURS//,/ } " == *" $hour "* ]]; then
             echo "open=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Outside weekdays 7 AM-7 PM Eastern; nothing to do."
+            echo "Eastern hour $hour (day $day) isn't a weekday act hour ($ACT_HOURS); nothing to do."
             echo "open=false" >> "$GITHUB_OUTPUT"
           fi
 
