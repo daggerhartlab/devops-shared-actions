@@ -1,0 +1,171 @@
+name: 'Security update: client email'
+description: >-
+  Builds the plain-text "security update applied" email for a site's client
+  from the security update PR's data block, shows it in the job summary, and
+  (with send: true) sends it through Mailgun's API.
+
+inputs:
+  notify_config:
+    description: 'SECURITY_UPDATE_NOTIFY_CLIENT: YAML with mode, site_name, to'
+    required: true
+  email_config:
+    description: 'SECURITY_UPDATE_EMAIL: YAML with from, reply_to'
+    required: true
+  pr_number:
+    description: 'The security update PR (its description holds the update data)'
+    required: true
+  github_token:
+    description: 'Token that can read the PR'
+    required: true
+  live_at:
+    description: 'When the release reached live, ISO 8601 (UTC)'
+    required: true
+  reviewed:
+    description: "'true' when a person approved a gate during the release"
+    required: false
+    default: 'false'
+  send:
+    description: "'true' sends the email; otherwise it's only built and shown"
+    required: false
+    default: 'false'
+  mailgun_key:
+    description: 'Mailgun domain sending key (LABBY_MAILGUN_SENDING_KEY); needed to send'
+    required: false
+    default: ''
+  mailgun_domain:
+    description: 'MAILGUN_DOMAIN'
+    required: false
+    default: ''
+  mailgun_api_base:
+    description: 'MAILGUN_API_BASE'
+    required: false
+    default: 'https://api.mailgun.net'
+
+outputs:
+  recipients:
+    description: 'Number of recipients'
+    value: ${{ steps.email.outputs.recipients }}
+  subject:
+    description: 'Email subject'
+    value: ${{ steps.email.outputs.subject }}
+
+runs:
+  using: composite
+  steps:
+    - id: email
+      shell: bash
+      env:
+        NOTIFY_CONFIG: ${{ inputs.notify_config }}
+        EMAIL_CONFIG: ${{ inputs.email_config }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        LIVE_AT: ${{ inputs.live_at }}
+        REVIEWED: ${{ inputs.reviewed }}
+        SEND: ${{ inputs.send }}
+        MAILGUN_KEY: ${{ inputs.mailgun_key }}
+        MAILGUN_DOMAIN: ${{ inputs.mailgun_domain }}
+        MAILGUN_API_BASE: ${{ inputs.mailgun_api_base }}
+      run: |
+        set -euo pipefail
+        # Variables saved from GitHub's web form have CRLF line endings.
+        notify=$(printf '%s' "$NOTIFY_CONFIG" | tr -d '\r')
+        email=$(printf '%s' "$EMAIL_CONFIG" | tr -d '\r')
+
+        site_name=$(yq '.site_name // ""' <<< "$notify")
+        site_name="${site_name:-${GITHUB_REPOSITORY#*/}}"
+        from=$(yq '.from // ""' <<< "$email")
+        reply_to=$(yq '.reply_to // ""' <<< "$email")
+        mapfile -t to < <(yq '.to // [] | .[]' <<< "$notify")
+        if [ "${#to[@]}" -eq 0 ]; then
+          echo "::error::SECURITY_UPDATE_NOTIFY_CLIENT has no 'to' recipients."
+          exit 1
+        fi
+        if [ -z "$from" ]; then
+          echo "::error::SECURITY_UPDATE_EMAIL has no 'from' address."
+          exit 1
+        fi
+
+        body=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+        data=$(grep -oE '<!-- security-update-data: .* -->' <<< "$body" | sed -E 's/^<!-- security-update-data: //; s/ -->$//' || true)
+        if [ -z "$data" ] || ! jq -e 'length > 0' <<< "$data" > /dev/null; then
+          echo "::error::PR #$PR_NUMBER has no security update data block; can't describe the update."
+          exit 1
+        fi
+
+        # Dates and times in US Eastern.
+        live_date=$(TZ=America/New_York date -d "$LIVE_AT" '+%B %-d, %Y')
+        live_time=$(TZ=America/New_York date -d "$LIVE_AT" '+%-I:%M %p %Z')
+        subject="Security update applied: ${site_name}, ${live_date}"
+
+        updates=$(jq -r '.[] | "- \(.name) \(.from) -> \(.to)" + (if (.advisories | length) > 0 then ", fixing " + ([.advisories[] | .id] | join(", ")) else "" end)' <<< "$data")
+        links=$(jq -r '[.[].advisories[]] | unique_by(.id) | .[] | "  \(.id): \(.link)"' <<< "$data")
+
+        checks="Before and after releasing, we checked the site's key pages automatically: that they load correctly, display their content, and don't show errors."
+        if [ "$REVIEWED" = "true" ]; then
+          checks="$checks A team member also reviewed the release."
+        fi
+
+        text=$(printf '%s\n' \
+          "Hi," \
+          "" \
+          "We applied a security update to ${site_name}, and it went live on ${live_date} at ${live_time}." \
+          "" \
+          "Updated:" \
+          "${updates}" \
+          "" \
+          "Advisories:" \
+          "${links}" \
+          "" \
+          "${checks}" \
+          "" \
+          "No action is needed on your part. Reply to this email if you have any questions." \
+          "" \
+          "Daggerhart Lab")
+
+        {
+          echo "recipients=${#to[@]}"
+          echo "subject=$subject"
+        } >> "$GITHUB_OUTPUT"
+
+        # The full email is shown once, when it's built for review; sending
+        # only adds a receipt.
+        if [ "$SEND" != "true" ]; then
+          {
+            echo "### Client email"
+            echo ""
+            echo "**To:** $(printf '%s, ' "${to[@]}" | sed 's/, $//')  "
+            echo "**From:** ${from}  "
+            if [ -n "$reply_to" ]; then
+              echo "**Reply-To:** ${reply_to}  "
+            fi
+            echo "**Subject:** ${subject}"
+            echo ""
+            echo '```'
+            echo "$text"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Built the email for ${#to[@]} recipient(s); not sending."
+          exit 0
+        fi
+        if [ -z "$MAILGUN_KEY" ] || [ -z "$MAILGUN_DOMAIN" ]; then
+          echo "::error::Mailgun key or domain is missing; can't send."
+          exit 1
+        fi
+
+        args=(--form-string "from=$from" --form-string "subject=$subject" --form-string "text=$text")
+        for address in "${to[@]}"; do
+          args+=(--form-string "to=$address")
+        done
+        if [ -n "$reply_to" ]; then
+          args+=(--form-string "h:Reply-To=$reply_to")
+        fi
+        status=$(curl -sS -o "$RUNNER_TEMP/mailgun.json" -w '%{http_code}' \
+          --user "api:$MAILGUN_KEY" \
+          "${MAILGUN_API_BASE%/}/v3/${MAILGUN_DOMAIN}/messages" "${args[@]}")
+        if [ "$status" != "200" ]; then
+          echo "::error::Mailgun returned HTTP $status: $(cat "$RUNNER_TEMP/mailgun.json")"
+          exit 1
+        fi
+        message_id=$(jq -r '.id // ""' "$RUNNER_TEMP/mailgun.json")
+        echo "Sent to ${#to[@]} recipient(s): $message_id"
+        echo "**Client email sent** to ${#to[@]} recipient(s): \"${subject}\" (Mailgun ID \`${message_id}\`)" >> "$GITHUB_STEP_SUMMARY"

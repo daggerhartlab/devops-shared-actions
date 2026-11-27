@@ -1,0 +1,156 @@
+name: 'Security update: Slack'
+description: >-
+  Posts a security update message to Slack as Daggerhart Labby. With a PR
+  number, replies in that PR's thread (starting the thread if it doesn't exist
+  yet and saving its ID in the PR description). Mentions people per
+  SECURITY_UPDATE_SLACK_MENTIONS. Never fails the calling job: problems are
+  reported as annotations.
+
+inputs:
+  slack_token:
+    description: 'Slack bot token (LABBY_SLACK_BOT_TOKEN)'
+    required: true
+  channel_config:
+    description: 'SECURITY_UPDATE_SLACK_CHANNEL: YAML with one "name: channel ID" entry'
+    required: true
+  mentions_config:
+    description: 'SECURITY_UPDATE_SLACK_MENTIONS: YAML with people (label: ID) and mention (kind: [labels])'
+    required: false
+    default: ''
+  kind:
+    description: 'failure, approval, success, info, or alert (alert broadcasts to the channel with @channel)'
+    required: true
+  stage:
+    description: 'update, merge, dev, test, live or email; "<kind>-<stage>" mention keys win over "<kind>"'
+    required: false
+    default: ''
+  text:
+    description: 'Message text (Slack mrkdwn)'
+    required: true
+  pr_number:
+    description: 'Security update PR whose thread to reply in. Empty posts a top-level message.'
+    required: false
+    default: ''
+  github_token:
+    description: 'Token that can read and edit the PR description (to store the thread ID)'
+    required: false
+    default: ''
+
+outputs:
+  thread_ts:
+    description: 'The thread the message was posted in, if any'
+    value: ${{ steps.post.outputs.thread_ts }}
+
+runs:
+  using: composite
+  steps:
+    - id: post
+      shell: bash
+      env:
+        SLACK_TOKEN: ${{ inputs.slack_token }}
+        CHANNEL_CONFIG: ${{ inputs.channel_config }}
+        MENTIONS_CONFIG: ${{ inputs.mentions_config }}
+        KIND: ${{ inputs.kind }}
+        STAGE: ${{ inputs.stage }}
+        TEXT: ${{ inputs.text }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set -uo pipefail
+        # Full repo name in code format: Slack would link a bare domain-like name.
+        site="\`${GITHUB_REPOSITORY}\`"
+        marker_re='<!-- slack-thread: ([0-9.]+) -->'
+
+        # Variables saved from GitHub's web form have CRLF line endings.
+        channel_yaml=$(printf '%s' "$CHANNEL_CONFIG" | tr -d '\r')
+        mentions_yaml=$(printf '%s' "$MENTIONS_CONFIG" | tr -d '\r')
+
+        if [ -z "$SLACK_TOKEN" ]; then
+          echo "::warning::Slack: LABBY_SLACK_BOT_TOKEN is empty; not posting."
+          exit 0
+        fi
+        if [ "$(yq 'length' <<< "$channel_yaml" 2>/dev/null)" != "1" ]; then
+          echo "::error::Slack: SECURITY_UPDATE_SLACK_CHANNEL must be YAML with exactly one 'name: channel ID' entry; not posting."
+          exit 0
+        fi
+        channel_name=$(yq 'keys | .[0]' <<< "$channel_yaml")
+        channel=$(yq '.[keys | .[0]]' <<< "$channel_yaml")
+        if [[ ! "$channel" =~ ^[CG][A-Z0-9]+$ ]]; then
+          echo "::error::Slack: '$channel' (for $channel_name) isn't a channel ID; not posting."
+          exit 0
+        fi
+
+        # Mentions: "<kind>-<stage>" if present, else "<kind>".
+        mentions=""
+        if [ "$KIND" = "alert" ]; then
+          mentions="<!channel>"
+        elif [ -n "$mentions_yaml" ]; then
+          key="$KIND"
+          if [ -n "$STAGE" ] && [ "$(yq ".mention | has(\"$KIND-$STAGE\")" <<< "$mentions_yaml" 2>/dev/null)" = "true" ]; then
+            key="$KIND-$STAGE"
+          fi
+          while IFS= read -r label; do
+            [ -n "$label" ] && [ "$label" != "null" ] || continue
+            id=$(yq ".people[\"$label\"] // \"\"" <<< "$mentions_yaml")
+            if [[ "$id" =~ ^[UW][A-Z0-9]+$ ]]; then
+              mentions+="<@$id> "
+            elif [[ "$id" =~ ^S[A-Z0-9]+$ ]]; then
+              mentions+="<!subteam^$id> "
+            else
+              echo "::warning::Slack: mention '$label' (under '$key') has no valid ID in people; skipping it."
+            fi
+          done < <(yq ".mention[\"$key\"] // [] | .[]" <<< "$mentions_yaml" 2>/dev/null)
+        fi
+
+        # Posts a message; prints its ts, or nothing on failure.
+        post() {
+          local payload response
+          payload=$(jq -n --arg channel "$channel" --arg text "$1" --arg thread "${2:-}" --arg broadcast "${3:-false}" '
+            {channel: $channel, text: $text, unfurl_links: false, unfurl_media: false}
+            + (if $thread != "" then {thread_ts: $thread} else {} end)
+            + (if $broadcast == "true" then {reply_broadcast: true} else {} end)')
+          response=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_TOKEN" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$payload") || { echo "::warning::Slack: request failed."; return 0; }
+          if [ "$(jq -r .ok <<< "$response")" != "true" ]; then
+            echo "::warning::Slack: chat.postMessage to $channel_name failed: $(jq -r '.error // "unknown error"' <<< "$response")"
+            return 0
+          fi
+          jq -r .ts <<< "$response"
+        }
+
+        thread=""
+        if [ -n "$PR_NUMBER" ]; then
+          pr=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,url,body 2>/dev/null) || pr=""
+          if [ -z "$pr" ]; then
+            echo "::warning::Slack: couldn't read PR #$PR_NUMBER; posting without a thread."
+          else
+            body=$(jq -r .body <<< "$pr")
+            if [[ "$body" =~ $marker_re ]]; then
+              thread="${BASH_REMATCH[1]}"
+            else
+              title=$(jq -r .title <<< "$pr")
+              url=$(jq -r .url <<< "$pr")
+              thread=$(post "${site}: <${url}|#${PR_NUMBER}> ${title}")
+              if [ -n "$thread" ]; then
+                printf '%s\n\n<!-- slack-thread: %s -->\n' "$body" "$thread" > "$RUNNER_TEMP/pr-body.md"
+                gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/pr-body.md" > /dev/null \
+                  || echo "::warning::Slack: couldn't save the thread ID to PR #$PR_NUMBER; later messages will start a new thread."
+              fi
+            fi
+          fi
+        fi
+
+        message="${mentions}${TEXT}"
+        if [ -z "$thread" ]; then
+          message="${site}: ${message}"
+        fi
+        broadcast=false
+        if [ "$KIND" = "alert" ] && [ -n "$thread" ]; then
+          broadcast=true
+        fi
+        ts=$(post "$message" "$thread" "$broadcast")
+        [ -n "$ts" ] && echo "Posted to $channel_name ($KIND${STAGE:+, $STAGE})."
+        echo "thread_ts=$thread" >> "$GITHUB_OUTPUT"
+        exit 0
