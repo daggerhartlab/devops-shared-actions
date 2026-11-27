@@ -1272,6 +1272,9 @@ used.
 - **A bare `#42` isn't a link.** Only closing keywords and sidebar links
   count, the same ones that close the issue on merge. Issues in other
   repositories are skipped.
+- **One unreadable parent drops them all.** If a linked issue's parent is in
+  a private repository this repo's token can't read, GitHub fails the whole
+  request, and the review runs without any issues, with a warning.
 - **Projects, discussions and wiki pages aren't read.** Projects aren't
   available to `GITHUB_TOKEN` at all, and the others are rarely linked from a
   PR. Put requirements in the issue.
