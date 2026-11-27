@@ -1,0 +1,198 @@
+name: 'Security update: sweep'
+
+# Reusable workflow. Nudges in Slack about security updates that are stuck:
+# - an open security-update/* PR whose required checks haven't all reported
+#   after pr_checks_stuck_after seconds (checks that failed are already
+#   reported by "Security update: merge");
+# - a run of the repository's release workflow waiting at an approval gate
+#   for longer than approval_waiting_after seconds.
+# At most one nudge per item per day. Changes nothing else.
+#
+# Scheduled runs act only on weekdays, at the US Eastern hours in act_hours.
+# Schedules are UTC, so the caller schedules each hour at both of its UTC
+# offsets (daylight saving), and the run that isn't at an act hour skips.
+# The first hour catches anything that stalled overnight. Manual runs always
+# act.
+
+on:
+  workflow_call:
+    inputs:
+      required_checks:
+        description: 'The same list the merge workflow is given, one per line'
+        type: string
+        required: true
+      release_workflow:
+        description: "File name of the repository's security update release workflow"
+        type: string
+        default: security-update-release.yml
+      pr_checks_stuck_after:
+        description: 'Seconds after the last push before unreported checks count as stuck'
+        type: number
+        default: 7200
+      approval_waiting_after:
+        description: 'Seconds an approval gate may wait before a nudge'
+        type: number
+        default: 14400
+      act_hours:
+        description: 'US Eastern hours (0-23, space-separated) when scheduled runs act, on weekdays'
+        type: string
+        default: '7 11 15'
+    secrets:
+      LABBY_SLACK_BOT_TOKEN:
+        required: false
+
+permissions:
+  actions: read
+  contents: read
+  # Write: the nudge markers live in the PR description.
+  pull-requests: write
+
+env:
+  PR_CHECKS_STUCK_AFTER: ${{ inputs.pr_checks_stuck_after }}
+  APPROVAL_WAITING_AFTER: ${{ inputs.approval_waiting_after }}
+  REQUIRED_CHECKS: ${{ inputs.required_checks }}
+  RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
+  BRANCH_PREFIX: security-update/
+
+jobs:
+  find:
+    name: Find stuck items
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      items: ${{ steps.find.outputs.items }}
+    steps:
+      - name: At an act hour
+        id: window
+        if: github.event_name == 'schedule'
+        env:
+          ACT_HOURS: ${{ inputs.act_hours }}
+        run: |
+          day=$(TZ=America/New_York date +%u)
+          hour=$(TZ=America/New_York date +%-H)
+          if [ "$day" -le 5 ] && [[ " ${ACT_HOURS//,/ } " == *" $hour "* ]]; then
+            echo "open=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Eastern hour $hour (day $day) isn't a weekday act hour ($ACT_HOURS); nothing to do."
+            echo "open=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find stuck PRs and waiting approvals
+        id: find
+        if: steps.window.outputs.open != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          today=$(TZ=America/New_York date +%F)
+          items='[]'
+          required="$REQUIRED_CHECKS"
+
+          # Adds an item unless this PR was already nudged about it today, and
+          # records the nudge in the PR description.
+          add() {
+            local pr="$1" key="$2" kind="$3" stage="$4" text="$5" body marker
+            marker="<!-- security-update-sweep: $key $today -->"
+            if [ -n "$pr" ]; then
+              body=$(gh pr view "$pr" --repo "$REPO" --json body --jq .body)
+              if grep -qF "$marker" <<< "$body"; then
+                echo "#$pr: already nudged about $key today."
+                return
+              fi
+              # Replace any earlier marker for this key.
+              printf '%s\n\n%s\n' "$(sed -E "/<!-- security-update-sweep: $key [0-9-]+ -->/d" <<< "$body")" "$marker" > "$RUNNER_TEMP/body.md"
+              gh pr edit "$pr" --repo "$REPO" --body-file "$RUNNER_TEMP/body.md" > /dev/null
+            fi
+            items=$(jq -c --arg pr "$pr" --arg kind "$kind" --arg stage "$stage" --arg text "$text" \
+              '. + [{pr: $pr, kind: $kind, stage: $stage, text: $text}]' <<< "$items")
+          }
+
+          # Stuck PRs: required checks not all reported long after the last push.
+          while read -r pr; do
+            number=$(jq -r .number <<< "$pr")
+            sha=$(jq -r .headRefOid <<< "$pr")
+            url=$(jq -r .url <<< "$pr")
+            pushed=$(gh api "repos/$REPO/commits/$sha" --jq .commit.committer.date)
+            age=$(( now - $(date -u -d "$pushed" +%s) ))
+            [ "$age" -ge "$PR_CHECKS_STUCK_AFTER" ] || continue
+
+            # Among a context's newest statuses, the worst state wins (Tugboat
+            # posts pending and success in the same second).
+            states=$( {
+              gh api "repos/$REPO/commits/$sha/statuses" --paginate --jq '.[]' | jq -rs '
+                def rank: {"error": 3, "failure": 3, "pending": 2, "success": 1}[.] // 2;
+                group_by(.context)[]
+                | (map(.created_at) | max) as $newest
+                | [.[] | select(.created_at == $newest)]
+                | max_by(.state | rank)
+                | [.context, .state] | @tsv'
+              gh api "repos/$REPO/commits/$sha/check-runs" --paginate \
+                --jq '.check_runs[] | [.name, (if .status == "completed" then .conclusion else "pending" end)] | @tsv'
+            } )
+            waiting=()
+            while IFS= read -r check; do
+              [ -n "$check" ] || continue
+              state=$(awk -F'\t' -v c="$check" '$1 == c { print $2; exit }' <<< "$states")
+              case "${state:-missing}" in
+                pending|queued|in_progress|missing) waiting+=("$check (${state:-not reported})") ;;
+              esac
+            done <<< "$required"
+            [ "${#waiting[@]}" -gt 0 ] || continue
+
+            hours=$(( age / 3600 ))
+            list=$(printf '%s, ' "${waiting[@]}")
+            add "$number" "checks" failure merge \
+              ":hourglass: Still not merged after ${hours}h: required checks haven't reported: ${list%, }. <$url|PR> · <$RUN_URL|Sweep>"
+          done < <(gh pr list --repo "$REPO" --state open --json number,headRefName,headRefOid,url \
+            --jq ".[] | select(.headRefName | startswith(\"$BRANCH_PREFIX\")) | @json")
+
+          # Waiting approvals on release runs.
+          while read -r run; do
+            run_id=$(jq -r .id <<< "$run")
+            run_url=$(jq -r .html_url <<< "$run")
+            head_sha=$(jq -r .head_sha <<< "$run")
+            pr=$(gh api "repos/$REPO/commits/$head_sha/pulls" \
+              --jq "[.[] | select(.merged_at != null and (.head.ref | startswith(\"$BRANCH_PREFIX\")))][0].number // empty")
+            while read -r pending; do
+              env_name=$(jq -r .environment.name <<< "$pending")
+              since=$(jq -r '.wait_timer_started_at // empty' <<< "$pending")
+              since="${since:-$(jq -r .updated_at <<< "$run")}"
+              age=$(( now - $(date -u -d "$since" +%s) ))
+              [ "$age" -ge "$APPROVAL_WAITING_AFTER" ] || continue
+              hours=$(( age / 3600 ))
+              stage="${env_name#security-update-verify-}"
+              [ "$env_name" = "security-update-notify-client" ] && stage=email
+              add "$pr" "approval-$run_id-$env_name" approval "$stage" \
+                ":hourglass: Still waiting for approval after ${hours}h: *${env_name}*. <$run_url|Run>"
+            done < <(gh api "repos/$REPO/actions/runs/$run_id/pending_deployments" --jq '.[] | @json')
+          done < <(gh api "repos/$REPO/actions/workflows/$RELEASE_WORKFLOW/runs?status=waiting" \
+            --jq '.workflow_runs[] | @json')
+
+          echo "items=$items" >> "$GITHUB_OUTPUT"
+          echo "Found $(jq length <<< "$items") item(s) to nudge."
+
+  nudge:
+    name: Nudge
+    needs: find
+    if: needs.find.outputs.items != '' && needs.find.outputs.items != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.find.outputs.items) }}
+    steps:
+      - name: Slack
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ matrix.item.pr }}
+          kind: ${{ matrix.item.kind }}
+          stage: ${{ matrix.item.stage }}
+          text: ${{ matrix.item.text }}

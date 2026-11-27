@@ -1398,3 +1398,254 @@ jobs:
           grep -qF '::warning::' "$RUNNER_TEMP/log" || { echo "::error::bad response: no warning"; fail=1; }
 
           exit "$fail"
+
+  website-smoke-test:
+    name: Website smoke test
+    runs-on: ubuntu-latest
+    # Read: waits for the baseline artifact to be listed.
+    permissions:
+      actions: read
+      contents: read
+    env:
+      # A failing page fails once instead of three times.
+      SMOKE_RETRIES: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A two-page static site: / passes every check, /broken/ lacks the
+      # element its config requires.
+      - name: Build and serve a fixture site
+        run: |
+          mkdir -p smokefix/site/broken
+          page() {
+            printf '%s\n' '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
+              "<title>$1 | Fixture</title><link rel=\"icon\" href=\"data:,\"></head><body>" \
+              "<main><h1>$1</h1><p>$(printf 'Fixture content. %.0s' $(seq 1 20))</p></main>" \
+              '<footer>Footer</footer></body></html>'
+          }
+          page Home > smokefix/site/index.html
+          page Broken > smokefix/site/broken/index.html
+          cat > smokefix/website-smoke-test.yml <<'EOF'
+          environments:
+            local: http://127.0.0.1:8080
+          defaults:
+            content_selector: main
+            min_content_chars: 100
+            min_body_bytes: 200
+            title_pattern: 'Fixture'
+            required:
+              - footer
+          paths:
+            - path: /
+          EOF
+          cat > smokefix/broken.yml <<'EOF'
+          environments:
+            local: http://127.0.0.1:8080
+          defaults:
+            min_body_bytes: 200
+          paths:
+            - path: /broken/
+              required:
+                - '.not-on-the-page'
+          EOF
+          python3 -m http.server 8080 --bind 127.0.0.1 --directory smokefix/site > /dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fs http://127.0.0.1:8080/ > /dev/null && exit 0; sleep 0.5; done
+          echo "::error::fixture server didn't start"
+          exit 1
+
+      - name: Run website-smoke-test (check)
+        id: check
+        uses: ./.github/actions/website-smoke-test
+        with:
+          environment: local
+          config: smokefix/website-smoke-test.yml
+
+      - name: Run website-smoke-test (baseline)
+        id: baseline
+        uses: ./.github/actions/website-smoke-test
+        with:
+          environment: local
+          mode: baseline
+          config: smokefix/website-smoke-test.yml
+
+      # A just-uploaded artifact can take a few seconds to be listed; in real
+      # use, compare runs in a later job.
+      - name: Wait for the baseline artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 30); do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              --jq '.artifacts[].name' | grep -qx website-smoke-test-snapshots-local && exit 0
+            sleep 2
+          done
+          echo "::error::baseline artifact never listed"
+          exit 1
+
+      - name: Run website-smoke-test (compare)
+        id: compare
+        uses: ./.github/actions/website-smoke-test
+        with:
+          environment: local
+          mode: compare
+          config: smokefix/website-smoke-test.yml
+
+      - name: Run website-smoke-test (failing page, reported only)
+        id: reported
+        uses: ./.github/actions/website-smoke-test
+        with:
+          environment: local
+          config: smokefix/broken.yml
+          fail_on_failure: 'false'
+
+      - name: Run website-smoke-test (failing page)
+        id: failing
+        continue-on-error: true
+        uses: ./.github/actions/website-smoke-test
+        with:
+          environment: local
+          config: smokefix/broken.yml
+
+      - name: Run website-smoke-test (missing config)
+        id: noconfig
+        continue-on-error: true
+        uses: ./.github/actions/website-smoke-test
+        with:
+          environment: local
+          config: smokefix/missing.yml
+
+      - name: Assert
+        env:
+          CHECK: ${{ steps.check.outputs.result }}
+          BASELINE: ${{ steps.baseline.outputs.result }}
+          COMPARE: ${{ steps.compare.outputs.result }}
+          REPORTED: ${{ steps.reported.outputs.result }}
+          REPORTED_OUTCOME: ${{ steps.reported.outcome }}
+          FAILING: ${{ steps.failing.outputs.result }}
+          FAILING_OUTCOME: ${{ steps.failing.outcome }}
+          NOCONFIG_OUTCOME: ${{ steps.noconfig.outcome }}
+        run: |
+          fail=0
+          expect() { [ "$2" = "$3" ] || { echo "::error::$1: expected '$3', got '$2'"; fail=1; }; }
+          expect 'check result' "$CHECK" passed
+          expect 'baseline result' "$BASELINE" passed
+          expect 'compare result' "$COMPARE" passed
+          expect 'failing page with fail_on_failure false: result' "$REPORTED" failed
+          expect 'failing page with fail_on_failure false: step' "$REPORTED_OUTCOME" success
+          expect 'failing page: result' "$FAILING" failed
+          expect 'failing page: step' "$FAILING_OUTCOME" failure
+          expect 'missing config: step' "$NOCONFIG_OUTCOME" failure
+          ls "$RUNNER_TEMP"/website-smoke-test-snapshots/local/home.png > /dev/null \
+            || { echo "::error::baseline: no screenshot saved"; fail=1; }
+          exit "$fail"
+
+  security-update-slack:
+    name: Security update Slack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Notifications must never fail the job they report on.
+      - name: Run security-update-slack (no token)
+        id: notoken
+        uses: ./.github/actions/security-update-slack
+        with:
+          slack_token: ''
+          channel_config: 'security: C0123456789'
+          kind: failure
+          text: test
+
+      - name: Run security-update-slack (bad channel config)
+        id: badchannel
+        uses: ./.github/actions/security-update-slack
+        with:
+          slack_token: not-a-real-token
+          channel_config: 'not: a: channel'
+          kind: info
+          text: test
+
+      - name: Run security-update-slack (invalid token)
+        id: badtoken
+        uses: ./.github/actions/security-update-slack
+        with:
+          slack_token: not-a-real-token
+          channel_config: 'security: C0123456789'
+          kind: alert
+          text: test
+
+  security-update-client-email:
+    name: Security update client email
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The action reads the PR description with gh; a stand-in answers with
+      # a fixture body.
+      - name: Stand-in gh
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          data='[{"name":"acme/lib","from":"1.0.0","to":"1.0.1","advisories":[{"id":"CVE-2026-0001","link":"https://example.com/a"}]},{"name":"acme/other","from":"2.0.0","to":"2.1.0","advisories":[{"id":"CVE-2026-0001","link":"https://example.com/a"},{"id":"GHSA-xxxx","link":"https://example.com/b"}]}]'
+          printf 'Updates.\n\n<!-- security-update-data: %s -->\n' "$data" > "$RUNNER_TEMP/body.txt"
+          # shellcheck disable=SC2016
+          printf '%s\n' '#!/bin/sh' 'cat "$RUNNER_TEMP/body.txt"' > "$bin/gh"
+          chmod +x "$bin/gh"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Run security-update-client-email (build only)
+        id: build
+        uses: ./.github/actions/security-update-client-email
+        with:
+          notify_config: |
+            mode: always-ask
+            site_name: Example Site
+            to:
+              - one@example.com
+              - two@example.com
+          email_config: |
+            from: Sender <sender@example.com>
+            reply_to: help@example.com
+          pr_number: '7'
+          github_token: unused
+          live_at: '2026-11-27T20:15:00Z'
+          reviewed: 'true'
+
+      - name: Run security-update-client-email (no recipients)
+        id: noto
+        continue-on-error: true
+        uses: ./.github/actions/security-update-client-email
+        with:
+          notify_config: 'mode: auto'
+          email_config: 'from: sender@example.com'
+          pr_number: '7'
+          github_token: unused
+          live_at: '2026-11-27T20:15:00Z'
+
+      - name: Run security-update-client-email (send without Mailgun)
+        id: nomailgun
+        continue-on-error: true
+        uses: ./.github/actions/security-update-client-email
+        with:
+          notify_config: |
+            to: [one@example.com]
+          email_config: 'from: sender@example.com'
+          pr_number: '7'
+          github_token: unused
+          live_at: '2026-11-27T20:15:00Z'
+          send: 'true'
+
+      - name: Assert
+        env:
+          SUBJECT: ${{ steps.build.outputs.subject }}
+          RECIPIENTS: ${{ steps.build.outputs.recipients }}
+          NOTO: ${{ steps.noto.outcome }}
+          NOMAILGUN: ${{ steps.nomailgun.outcome }}
+        run: |
+          fail=0
+          expect() { [ "$2" = "$3" ] || { echo "::error::$1: expected '$3', got '$2'"; fail=1; }; }
+          # 20:15 UTC is 3:15 PM Eastern on the same day.
+          expect subject "$SUBJECT" 'Security update applied: Example Site, November 27, 2026'
+          expect recipients "$RECIPIENTS" 2
+          expect 'no recipients: step' "$NOTO" failure
+          expect 'send without Mailgun: step' "$NOMAILGUN" failure
+          exit "$fail"

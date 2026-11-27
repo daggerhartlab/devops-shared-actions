@@ -204,6 +204,10 @@ runs:
         # GITHUB_TOKEN does not fire pull_request:synchronize, so CI would stay
         # silent on re-runs.
         git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+        # The lease compares against our copy of the remote branch, and
+        # checkout only fetched the base branch: without this, re-running for a
+        # version whose branch already exists fails with "stale info".
+        git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true
         git push --force-with-lease origin "$BRANCH"
 
     - name: Open or update the pull request

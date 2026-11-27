@@ -1,0 +1,9 @@
+{
+  "name": "website-smoke-test",
+  "private": true,
+  "description": "Smoke test for the environments in a site's website-smoke-test.yml (SMOKE_CONFIG).",
+  "devDependencies": {
+    "@playwright/test": "1.65.1",
+    "yaml": "^2.8.0"
+  }
+}

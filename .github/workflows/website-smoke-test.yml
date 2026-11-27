@@ -1,0 +1,61 @@
+name: Website smoke test
+
+# Reusable workflow: one job that checks out the calling repository and runs
+# the website-smoke-test action against one environment of its
+# .github/website-smoke-test.yml. The security update release chain runs the
+# action directly; this is for a site's own "Website smoke test" workflow.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment key from the config file'
+        type: string
+        required: true
+      mode:
+        description: 'check, baseline or compare'
+        type: string
+        default: check
+      config:
+        description: 'Path to the config file in the calling repository'
+        type: string
+        default: .github/website-smoke-test.yml
+      fail_on_failure:
+        description: 'Fail the job when the smoke test fails'
+        type: boolean
+        default: true
+    secrets:
+      BASIC_AUTH_USER:
+        required: false
+      BASIC_AUTH_PASSWORD:
+        required: false
+    outputs:
+      result:
+        description: 'passed or failed'
+        value: ${{ jobs.smoke.outputs.result }}
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke test ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.smoke.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ${{ inputs.config }}
+          sparse-checkout-cone-mode: false
+
+      - id: smoke
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+        with:
+          environment: ${{ inputs.environment }}
+          mode: ${{ inputs.mode }}
+          config: ${{ inputs.config }}
+          fail_on_failure: ${{ inputs.fail_on_failure }}
+          basic_auth_user: ${{ secrets.BASIC_AUTH_USER }}
+          basic_auth_password: ${{ secrets.BASIC_AUTH_PASSWORD }}

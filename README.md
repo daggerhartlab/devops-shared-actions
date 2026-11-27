@@ -34,6 +34,12 @@ every example below uses.
   per package with the version that fixes them.
 - [`composer-diff`](#composer-diff) — comments on a pull request with the
   package changes in each `composer.lock`, and keeps that comment current.
+- [`website-smoke-test`](#website-smoke-test) — checks one environment of a
+  site with Playwright: status, content, errors, and optionally screenshots
+  against a baseline.
+- `security-update-slack` and `security-update-client-email` — the
+  [security update pipeline](#security-update-pipeline)'s Slack messages and
+  client email.
 
 Reusable workflows:
 
@@ -43,6 +49,12 @@ Reusable workflows:
 - [`claude-review-github-issues`](#claude-review-github-issues) — the same
   review, plus the GitHub issues the PR is linked to, for repos that track
   work in GitHub issues instead of Jira.
+- [Security update pipeline](#security-update-pipeline):
+  `security-update`, `security-update-merge`, `security-update-release` and
+  `security-update-sweep` — audit, update, merge and release Composer
+  security updates from dev to live, with smoke tests, approval gates, Slack
+  and a client email. Plus `website-smoke-test`, for running the smoke test
+  by hand.
 
 The actions are composite actions; see each `action.yml` (or the workflow
 file) for the full, authoritative list of inputs and defaults. This README
@@ -1282,6 +1294,494 @@ used.
   available to `GITHUB_TOKEN` at all, and the others are rarely linked from a
   PR. Put requirements in the issue.
 
+---
+
+## Security update pipeline
+
+Ships Composer security updates from an audit to live, stopping at the first
+problem, with people approving where configured, and emails the client when
+it's done. Four reusable workflows, three actions:
+
+```
+security-update.yml           audit → update flagged packages → PR (Slack thread starts)
+        │
+security-update-merge.yml     required checks pass → merge as Daggerhart Labby
+        │                     (only if SECURITY_UPDATE_AUTO_MERGE_ENABLED is true)
+the repo's deploy workflow    existing dev deploy, triggered by the merge
+        │
+security-update-release.yml   smoke test dev → gate → the repo's dev-to-test release
+                              → smoke test test → gate (go/no-go for live)
+                              → baseline live → the repo's test-to-live release
+                              → smoke test live → gate → report
+                              → client email (gate) → sent
+
+security-update-sweep.yml     scheduled: nudges about stuck PRs and waiting approvals
+```
+
+| Piece | Kind | Does |
+|---|---|---|
+| `security-update.yml` | workflow | Audits each Composer root, updates only the flagged packages (`composer update <pkgs> -W`), and opens or updates the PR on `security-update/<YYYY-MM-DD>` (UTC), titled `Security update: <pkg> <from> -> <to>`. Lists other commits not yet on live ("Also ships with this release"). |
+| `security-update-merge.yml` | workflow | Merges an open `security-update/*` PR once every required check on its head commit has passed; comments once if one fails. |
+| `security-update-release.yml` | workflow | The release chain, gates, report and client email. |
+| `security-update-sweep.yml` | workflow | Nudges in Slack about PRs whose required checks haven't reported, and approvals left waiting. Once per item per day. |
+| `website-smoke-test.yml` | workflow | One smoke test job, for a site's manual "Website smoke test" runs. |
+| [`website-smoke-test`](#website-smoke-test) | action | Playwright checks of one environment of a site. |
+| `security-update-slack` | action | Posts to Slack in the PR's thread, with mentions. Never fails the job. |
+| `security-update-client-email` | action | Builds the client email from the PR, and sends it through Mailgun. |
+
+- **Scope:** Composer packages `composer audit` flags. On WordPress that
+  means Composer-managed plugins and themes and their dependencies; core has
+  [`wp-core-update`](#wp-core-update).
+- **Dev-only updates** (only `require-dev` packages flagged) stop after the
+  merge, since live code wouldn't change. A manual release run with
+  `release_dev_only` sends one through anyway.
+- **Who acts:** commits, PRs and merges are made by the Daggerhart Labby
+  GitHub App (`daggerhart-labby[bot]`), so they trigger the repo's other
+  workflows. Slack messages come from the Daggerhart Labby Slack app.
+- **Any host.** The pipeline never talks to a host. The repo's own deploy and
+  release workflows do, and record what each environment runs in git tags
+  (below), which is all the pipeline reads.
+
+### What a repo needs
+
+1. **A dev deploy workflow** that runs on push to the default branch and, as
+   its last step, moves `deployed/dev` to the deployed commit:
+   ```yaml
+   - name: Move deployed/dev
+     env:
+       SHA: ${{ github.sha }}
+     run: |
+       git tag -f deployed/dev "$SHA"
+       git push -f origin refs/tags/deployed/dev
+   ```
+2. **Two release workflows** with `workflow_dispatch:`, dev to test and test
+   to live. Each moves its tag to the previous environment's commit after
+   releasing (`deployed/test` to `deployed/dev`, `deployed/live` to
+   `deployed/test`), and declares `permissions: contents: write`:
+   ```yaml
+   - name: Move deployed/test
+     run: |
+       if ! git fetch --quiet origin "+refs/tags/deployed/dev:refs/tags/deployed/dev"; then
+         echo "::warning::No deployed/dev tag yet; deployed/test not moved."
+         exit 0
+       fi
+       git tag -f deployed/test "deployed/dev^{commit}"
+       git push -f origin refs/tags/deployed/test
+   ```
+   The release chain starts them through the API on the default branch and
+   waits for them to finish. Until `deployed/live` exists, "Also ships with
+   this release" can't be listed; seed it from live's deployed commit, or let
+   the first release create it.
+3. **PR checks** to gate the merge on: status contexts or check runs, such as
+   Tugboat's `Tugboat` and `Tugboat - Visual Diffs`. Leave out anything
+   flaky; Lighthouse scores, for one, shouldn't block a security release.
+4. **A smoke test config** at `.github/website-smoke-test.yml`; see
+   [`website-smoke-test`](#website-smoke-test).
+5. **The six caller workflows** below, the environments, and the variables.
+
+### Caller workflows
+
+Each is a few lines; settings are inputs. File names are up to the repo,
+except that the sweep is told the release caller's file name.
+
+```yaml
+# .github/workflows/security-update.yml
+name: Security update
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would change without pushing or opening a PR'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/security-update.yml@v1
+    with:
+      # One Composer root per line, relative to the repo.
+      composer_dirs: |
+        .
+        wp-content/themes/example
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
+```
+
+```yaml
+# .github/workflows/security-update-merge.yml
+name: 'Security update: merge'
+
+on:
+  status:
+  check_run:
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/security-update-merge.yml@v1
+    with:
+      required_checks: |
+        Tugboat
+        Tugboat - Visual Diffs
+    secrets: inherit
+```
+
+```yaml
+# .github/workflows/security-update-release.yml
+name: 'Security update: release'
+
+on:
+  workflow_run:
+    # The dev deploy workflow's name, and the branch it deploys.
+    workflows: ['Deploy to Pantheon']
+    types: [completed]
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      release_dev_only:
+        description: 'Release a dev-only update'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Write: starts the release workflows.
+  actions: write
+  pull-requests: write
+
+concurrency:
+  group: security-update-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/security-update-release.yml@v1
+    with:
+      release_to_test: release-dev-to-test.yml
+      release_to_live: release-test-to-live.yml
+      release_dev_only: ${{ inputs.release_dev_only == true }}
+    secrets: inherit
+```
+
+```yaml
+# .github/workflows/security-update-sweep.yml
+name: 'Security update: sweep'
+
+on:
+  # Acts weekdays at 7 AM, 11 AM and 3 PM US Eastern (act_hours); each hour
+  # is scheduled at both of its UTC offsets, and the other run skips.
+  schedule:
+    - cron: '0 11,12,15,16,19,20 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  sweep:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/security-update-sweep.yml@v1
+    with:
+      # The same list as the merge workflow's.
+      required_checks: |
+        Tugboat
+        Tugboat - Visual Diffs
+      release_workflow: security-update-release.yml
+    secrets: inherit
+```
+
+```yaml
+# .github/workflows/website-smoke-test.yml
+name: Website smoke test
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        type: choice
+        options: [dev, test, live]
+        default: live
+      mode:
+        description: 'Mode'
+        type: choice
+        options: [check, baseline]
+        default: check
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/website-smoke-test.yml@v1
+    with:
+      environment: ${{ inputs.environment }}
+      mode: ${{ inputs.mode }}
+    secrets: inherit
+```
+
+`secrets: inherit` works within the organization (and enterprise). From
+another organization, pass each secret instead, e.g.
+`LABBY_APP_ID: ${{ secrets.LABBY_APP_ID }}`; each workflow's `secrets:`
+block lists what it takes.
+
+Inputs, beyond those shown: `security-update.yml` takes `php_version`
+(default `8.3`); `security-update-release.yml` takes `smoke_test_config`
+(default `.github/website-smoke-test.yml`); `security-update-sweep.yml` takes
+`pr_checks_stuck_after` (seconds, default `7200`), `approval_waiting_after`
+(default `14400`) and `act_hours` (US Eastern hours, default `7 11 15`; change
+the caller's schedule to match).
+
+### Organization setup (once)
+
+- **GitHub App** (Daggerhart Labby): repository permissions Actions RW,
+  Contents RW, Pull requests RW, Checks R, Commit statuses R, Metadata R; no
+  webhook. Installed on selected repositories; add each repo that adopts the
+  pipeline. Changing permissions later makes every installation accept the
+  change.
+- **Slack app** (Daggerhart Labby): only the `chat:write` bot scope, no
+  webhooks or events. Invite the bot into the channel it posts to.
+- **Mailgun:** sends through the HTTP API with a domain sending key, which can
+  only send from its one domain.
+
+Secrets (organization; a repository secret of the same name overrides):
+
+| Secret | Holds | Used by |
+|---|---|---|
+| `LABBY_APP_ID` | GitHub App ID | update, merge |
+| `LABBY_APP_PRIVATE_KEY` | GitHub App private key (`.pem` contents). Give only the repos the App is installed on access; it can write to all of them. | update, merge |
+| `LABBY_SLACK_BOT_TOKEN` | Slack bot token (`xoxb-…`) | all |
+| `LABBY_MAILGUN_SENDING_KEY` | Mailgun domain sending key | release |
+| `BASIC_AUTH_USER`, `BASIC_AUTH_PASSWORD` | HTTP basic auth for locked pre-production environments; sent only when a server answers 401 | release, smoke test |
+
+Variables (organization unless noted; a repository variable of the same name
+overrides):
+
+| Variable | Format | Meaning |
+|---|---|---|
+| `SECURITY_UPDATE_SLACK_CHANNEL` | YAML, one `name: channel ID` entry | Where messages go. |
+| `SECURITY_UPDATE_SLACK_MENTIONS` | YAML (below) | Who is mentioned, per message kind. A repository value replaces the organization's entirely. |
+| `SECURITY_UPDATE_EMAIL` | YAML: `from`, `reply_to` | Client email sender; `from` must be on the Mailgun domain. |
+| `MAILGUN_DOMAIN` | plain | Mailgun sending domain. |
+| `MAILGUN_API_BASE` | plain | `https://api.mailgun.net` (US) or `https://api.eu.mailgun.net` (EU). |
+| `SECURITY_UPDATE_AUTO_MERGE_ENABLED` | repository; `true` or anything else | The merge workflow merges only when `true`; otherwise it reports "would merge". |
+| `SECURITY_UPDATE_VERIFY_DEV`, `_TEST`, `_LIVE` | repository; gate mode | Default `ask-on-failure`. |
+| `SECURITY_UPDATE_NOTIFY_CLIENT` | repository; YAML (below) | Client email. Unset means off. |
+| `SECURITY_UPDATE_APPROVAL_MECHANISM` | repository | Only `environment` (the default) exists so far. |
+
+Variables saved from GitHub's web form have Windows line endings; the
+workflows strip them.
+
+### Repository setup
+
+1. Add the repo to the GitHub App's installation and to
+   `LABBY_APP_PRIVATE_KEY`'s selected repositories.
+2. Create the environments, each with required reviewers (on private repos,
+   that needs GitHub Enterprise): `security-update-verify-dev`,
+   `security-update-verify-test`, `security-update-verify-live`,
+   `security-update-notify-client`.
+3. Add the caller workflows and `.github/website-smoke-test.yml`. Run
+   "Website smoke test" in `check` mode against dev, test and live until all
+   three pass.
+4. Set the repository variables: gate modes if not the default,
+   `SECURITY_UPDATE_NOTIFY_CLIENT` for a client email, and
+   `SECURITY_UPDATE_AUTO_MERGE_ENABLED` once the merge workflow's "would
+   merge" reports look right.
+5. Run "Security update" with `dry_run`, then for real when there's an
+   advisory, and follow the Slack thread.
+
+### Gates
+
+| Mode | Smoke test | Approval |
+|---|---|---|
+| `auto` | must pass | never; a failure stops the chain |
+| `ask-on-failure` (default) | runs | only if the smoke test fails |
+| `always-ask` | informational | always |
+
+Each gate is an environment (`security-update-verify-<env>`: who approves)
+paired with a variable (`SECURITY_UPDATE_VERIFY_<ENV>`: when it's used).
+Rejecting stops the chain; before live nothing further ships, after live
+nothing reverts. The test gate is the go/no-go for live: when other commits
+that change the site ship along with the update, it becomes `always-ask` for
+that run. To approve: open the waiting run → **Review deployments**.
+
+### Slack
+
+```yaml
+# SECURITY_UPDATE_SLACK_CHANNEL
+security_updates: C0123456789
+```
+
+```yaml
+# SECURITY_UPDATE_SLACK_MENTIONS
+# IDs: U… or W… for a person, S… for a user group.
+people:
+  alex: U0123456789
+  devops: S0123456789
+mention:
+  failure: [alex]
+  approval: [alex]
+  # Optional "<kind>-<stage>" keys win over the kind:
+  # approval-test: [devops]
+```
+
+Kinds: `info` (PR opened or updated, merged, dev-only stop, email sent),
+`failure`, `approval`, `success` (live confirmed), and `alert` (released to
+live but not confirmed: `@channel`, broadcast to the channel). Stages:
+`update`, `merge`, `dev`, `test`, `live`, `email`. Each PR gets a thread; its
+ID is saved in the PR description as `<!-- slack-thread: <ts> -->`, so don't
+remove it.
+
+### Client email
+
+```yaml
+# SECURITY_UPDATE_NOTIFY_CLIENT
+mode: always-ask      # off | always-ask | auto
+site_name: example.com
+to:
+  - client@example.com
+```
+
+Sent only after live is confirmed. Subject `Security update applied:
+<site_name>, <Month D, YYYY>`, times in US Eastern. Plain text: each package
+from → to with its advisories and links, when it went live, the automated
+checks (and that a person reviewed the release, when a gate was approved).
+With `always-ask` the full email is on the run's summary page; approve
+`security-update-notify-client` to send it. The content comes from
+`<!-- security-update-data: [...] -->` in the PR description.
+
+### Gotchas
+
+- **Grant the caller's permissions.** A reusable workflow can't have more
+  token permissions than its caller, and repos may default to a read-only
+  token. The callers above declare what each needs; the release caller needs
+  `actions: write` to start the release workflows.
+- **Workflow names matter.** The release caller's `workflow_run` names the
+  dev deploy workflow by its `name:`, and the `branches:` filter is the
+  branch it deploys.
+- **One security update PR at a time.** "Security update" refuses while a PR
+  from another day is open; a same-day re-run updates the existing PR.
+- **Every check report starts the merge workflow**, which skips at once for
+  non-security branches (no runner). Filter the Actions list by workflow.
+- **Everything on the default branch ships.** A security release carries all
+  commits not yet on live. "Also ships with this release" lists them in the
+  PR, Slack and the run summary; commits touching only `.github/` or
+  `.tugboat/` are marked as not affecting the site.
+- **Testing from a branch:** the reusable workflows call this repo's actions
+  at `@v1`. To test a change end to end, temporarily point those `uses:` at
+  the branch, as well as the consumer's callers.
+
+---
+
+## `website-smoke-test`
+
+Checks one environment of a site with Playwright and the runner's
+preinstalled Chrome (no browser download). The release chain runs it against
+dev, test and live; a site can also run it by hand through the
+`website-smoke-test.yml` reusable workflow (see the caller above).
+
+```yaml
+- uses: actions/checkout@v7
+- id: smoke
+  uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+  with:
+    environment: live
+    mode: check
+    fail_on_failure: 'false'
+- run: echo "Smoke test ${{ steps.smoke.outputs.result }}"
+```
+
+Inputs: `environment` (required), `mode` (`check`, `baseline` or `compare`;
+default `check`), `config` (default `.github/website-smoke-test.yml`),
+`fail_on_failure` (default `'true'`), `basic_auth_user`,
+`basic_auth_password`. Output: `result`, `passed` or `failed`.
+
+- `check`: page checks only.
+- `baseline`: checks, then saves full-page screenshots as the
+  `website-smoke-test-snapshots-<environment>` artifact (only when the checks
+  pass).
+- `compare`: checks, then compares screenshots against that artifact from
+  the same workflow run.
+
+The HTML report, failure screenshots and traces are in the
+`website-smoke-test-report-<environment>-<mode>` artifact.
+
+Per path it checks: HTTP 200, body size, a closing `</html>`, no PHP error
+output, the title, `<html lang>`, required selectors, the amount of text in
+the content region, no console errors, and no failed first-party CSS, JS,
+image or font requests. Pages are requested with a cache-busting `_smoke`
+query string, so the origin is tested rather than a cache.
+
+```yaml
+# .github/website-smoke-test.yml
+# An environment is a URL, or a url plus ignores that apply only there.
+environments:
+  dev:
+    url: https://dev-example.pantheonsite.io
+    ignore_console: &pre_prod_console
+      # reCAPTCHA keys restricted to the live domain.
+      - 'error initializing reCAPTCHA'
+  test:
+    url: https://test-example.pantheonsite.io
+    ignore_console: *pre_prod_console
+  live: https://www.example.com
+
+# Cloudflare challenges "HeadlessChrome" from GitHub's runners.
+user_agent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36'
+
+defaults:
+  content_selector: 'main, [role="main"]'
+  min_content_chars: 500
+  min_body_bytes: 20000
+  title_pattern: 'Example'
+  required:
+    - 'header nav a'
+    - 'footer'
+  mask: []          # regions that change between loads, painted over
+  hide: []          # hidden during screenshots
+  max_diff_pixel_ratio: 0.01
+
+ignore_console: []  # regexes, every environment
+ignore_requests: []
+
+paths:
+  - path: /
+  - path: /contact/
+    min_content_chars: 100
+    required:
+      - 'form button[type="submit"]'
+  - path: /search/
+    visual: false   # no screenshot for this page
+```
+
+`required`, `mask` and `hide` add to the defaults; other path keys override
+them.
+
+### Gotchas
+
+- **Cloudflare.** Its bot challenge blocks Chrome's headless user agent from
+  GitHub's runners; a browser `user_agent` gets through. If a site's
+  Cloudflare starts challenging anyway, set that site's gates to
+  `always-ask`.
+- **Pre-production noise.** Add per-environment `ignore_console` entries for
+  what only fails off the live domain, rather than loosening every
+  environment.
+- **Running it locally:** from a checkout of this repo,
+  `cd .github/actions/website-smoke-test && npm ci`, then
+  `SMOKE_CONFIG=/path/to/site/.github/website-smoke-test.yml SMOKE_ENVIRONMENT=dev SMOKE_VISUAL=off npx playwright test`.
+  `SMOKE_BASE_URL` overrides the environment's URL, e.g. for a local site.
+
+---
+
 ## Testing
 
 `.github/workflows/test.yml` runs on pull requests, pushes to `main`, a
@@ -1303,6 +1803,9 @@ once `v1` is moved onto it.
 | `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts the dev package is included by default and excluded with `no_dev`, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
 | `composer-diff` | Builds base and changed fixture commits, runs with `dry_run` across three lock files, asserts each is named, the changed tables are present, an unchanged lock collapses to one line, and a new lock shows its packages as new; that an unchanged-only run reports `changed=false`; and that a directory with no lock and a base missing from the checkout both fail |
 | `claude-review-github-issues` | Checks the wrapper declares exactly `claude-review`'s inputs and secrets (minus `github_issues`) and passes each one through, and that its fetch job has the review job's condition; then runs the fetch step against fixture GraphQL responses, asserting milestones, same- and cross-repo parents, the older-comments note, that other repositories' issues are skipped, that an oversized issue is cut, and that no issues, a failed request, or a response it can't render give no output (the latter two with a warning) |
+| `website-smoke-test` | Serves a two-page fixture site, asserts `check`, `baseline` (screenshot saved) and `compare` pass, that a page missing a required element reports `failed` and fails the step unless `fail_on_failure` is false, and that a missing config fails |
+| `security-update-slack` | No token, an invalid channel config, and a rejected token each leave the step successful |
+| `security-update-client-email` | Builds the email from a fixture PR description through a stand-in `gh`, asserting the subject (US Eastern date) and recipient count, and that no recipients, or sending without Mailgun settings, fail |
 
 Two things worth knowing if you extend this:
 

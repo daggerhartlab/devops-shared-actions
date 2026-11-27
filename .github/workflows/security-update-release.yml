@@ -1,0 +1,807 @@
+name: 'Security update: release'
+
+# Reusable workflow. Carries a merged security update from dev to live once
+# the repository's deploy workflow has deployed it to dev (the caller runs on
+# that workflow's completion):
+#   smoke test dev -> gate -> release to test -> smoke test test -> gate
+#   -> baseline live -> release to live -> compare live -> gate
+#
+# The releases themselves are the repository's own workflows
+# (release_to_test, release_to_live), started through the API and waited on,
+# so every host-specific step stays in the repository. They must accept
+# workflow_dispatch and move the deployed/test and deployed/live tags.
+#
+# Each gate is a GitHub environment (security-update-verify-<env>, the
+# approvers) paired with a repository variable (SECURITY_UPDATE_VERIFY_<ENV>,
+# when it's used):
+#   auto - smoke test must pass; never asks
+#   ask-on-failure - asks only if the smoke test fails (default)
+#   always-ask - always asks
+# The test gate is the last stop before live; the live gate confirms live
+# after the release.
+#
+# Every job after a gate states its condition with always(): a skipped gate
+# (no approval needed) would otherwise skip everything after it.
+#
+# Dev-only updates (only require-dev packages changed) stop at the merge:
+# live code wouldn't change. Run the caller by hand with release_dev_only to
+# release one anyway.
+
+on:
+  workflow_call:
+    inputs:
+      release_to_test:
+        description: "File name of the repository's dev-to-test release workflow"
+        type: string
+        required: true
+      release_to_live:
+        description: "File name of the repository's test-to-live release workflow"
+        type: string
+        required: true
+      release_dev_only:
+        description: 'Release a dev-only update'
+        type: boolean
+        default: false
+      smoke_test_config:
+        description: 'Path to the website smoke test config in the repository'
+        type: string
+        default: .github/website-smoke-test.yml
+    secrets:
+      LABBY_SLACK_BOT_TOKEN:
+        required: false
+      LABBY_MAILGUN_SENDING_KEY:
+        required: false
+      BASIC_AUTH_USER:
+        required: false
+      BASIC_AUTH_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+  # Write: the Slack action may store the thread ID in the PR description.
+  pull-requests: write
+
+jobs:
+  resolve:
+    name: Find the security update
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.find.outputs.proceed }}
+      pr_number: ${{ steps.find.outputs.pr_number }}
+      verify_dev: ${{ steps.modes.outputs.verify_dev }}
+      verify_test: ${{ steps.modes.outputs.verify_test }}
+      verify_live: ${{ steps.modes.outputs.verify_live }}
+      notify_client: ${{ steps.modes.outputs.notify_client }}
+    steps:
+      - name: Find the merged security update PR
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEPLOYED_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_DEV_ONLY: ${{ inputs.release_dev_only }}
+        run: |
+          # A manual run releases what's on the default branch (what dev runs),
+          # whichever ref the workflow was started from.
+          SHA="${DEPLOYED_SHA:-$(gh api "repos/$REPO/commits/$DEFAULT_BRANCH" --jq .sha)}"
+          pr=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null and (.head.ref | startswith("security-update/")))][0] // empty')
+          if [ -z "$pr" ]; then
+            echo "Deployed commit ${SHA:0:9} isn't a security update merge; nothing to release."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          number=$(jq -r .number <<< "$pr")
+          title=$(jq -r .title <<< "$pr")
+          echo "pr_number=$number" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Security update: release"
+            echo ""
+            echo "#${number}: ${title}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if jq -e '.body | contains("**Dev-only:**")' <<< "$pr" > /dev/null && [ "$RELEASE_DEV_ONLY" != "true" ]; then
+            {
+              echo "Dev-only update: stopping at the merge, since live code wouldn't change."
+              echo "To release it anyway, run this workflow by hand with **Release a dev-only update** (\`release_dev_only\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "proceed=false"
+              echo "dev_only_stop=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: What else ships
+        id: also
+        if: steps.find.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find.outputs.pr_number }}
+          DEPLOYED_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Commits that live doesn't run yet, other than the security update
+          # itself, ship with this release. Informational, except that site
+          # changes make the test gate always ask.
+          sha="${DEPLOYED_SHA:-$(gh api "repos/$REPO/commits/$DEFAULT_BRANCH" --jq .sha)}"
+          if ! compare=$(gh api "repos/$REPO/compare/deployed/live...$sha" 2>/dev/null); then
+            {
+              echo "### Also ships with this release"
+              echo ""
+              echo "Live's commit isn't known yet (no \`deployed/live\` tag)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "site=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pr_commits=$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate --jq '.[].sha')
+          site=0
+          pipeline=0
+          lines=()
+          while IFS= read -r commit; do
+            commit_sha=$(jq -r .sha <<< "$commit")
+            grep -qx "$commit_sha" <<< "$pr_commits" && continue
+            # Workflow and Tugboat changes don't affect the site.
+            if gh api "repos/$REPO/commits/$commit_sha" --jq '[.files[].filename] | all(startswith(".github/") or startswith(".tugboat/"))' | grep -q true; then
+              pipeline=$((pipeline + 1))
+              note=" (workflow/Tugboat only)"
+            else
+              site=$((site + 1))
+              note=""
+            fi
+            lines+=("- \`${commit_sha:0:9}\` $(jq -r '.commit.message | split("\n")[0]' <<< "$commit")${note}")
+          done < <(jq -c '.commits[] | select((.parents | length) == 1)' <<< "$compare")
+          {
+            echo "### Also ships with this release"
+            echo ""
+            if [ $((site + pipeline)) -eq 0 ]; then
+              echo "Nothing else: only the security update differs from live."
+            else
+              echo "$((site + pipeline)) other commit(s) not on live yet ($site affecting the site):"
+              echo ""
+              printf '%s\n' "${lines[@]}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "site=$site"
+            echo "total=$((site + pipeline))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read gate modes
+        id: modes
+        if: steps.find.outputs.proceed == 'true'
+        env:
+          MECHANISM: ${{ vars.SECURITY_UPDATE_APPROVAL_MECHANISM || 'environment' }}
+          VERIFY_DEV: ${{ vars.SECURITY_UPDATE_VERIFY_DEV || 'ask-on-failure' }}
+          VERIFY_TEST: ${{ vars.SECURITY_UPDATE_VERIFY_TEST || 'ask-on-failure' }}
+          VERIFY_LIVE: ${{ vars.SECURITY_UPDATE_VERIFY_LIVE || 'ask-on-failure' }}
+          NOTIFY_CLIENT_CONFIG: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
+          ALSO_SITE: ${{ steps.also.outputs.site }}
+        run: |
+          if [ "$MECHANISM" != "environment" ]; then
+            echo "::error::SECURITY_UPDATE_APPROVAL_MECHANISM '$MECHANISM' isn't supported yet; only 'environment' is."
+            exit 1
+          fi
+          for mode in "$VERIFY_DEV" "$VERIFY_TEST" "$VERIFY_LIVE"; do
+            case "$mode" in
+              auto|ask-on-failure|always-ask) ;;
+              *) echo "::error::Unknown gate mode '$mode'; use auto, ask-on-failure or always-ask."; exit 1 ;;
+            esac
+          done
+          # Other site changes riding along: a person confirms before live.
+          test_note=""
+          if [ "${ALSO_SITE:-0}" -gt 0 ] && [ "$VERIFY_TEST" != "always-ask" ]; then
+            test_note=" (was \`$VERIFY_TEST\`; other site changes ship with this release)"
+            VERIFY_TEST=always-ask
+          fi
+          notify_client=$(printf '%s' "$NOTIFY_CLIENT_CONFIG" | tr -d '\r' | yq '.mode // "off"')
+          case "$notify_client" in
+            off|always-ask|auto) ;;
+            *) echo "::error::Unknown SECURITY_UPDATE_NOTIFY_CLIENT mode '$notify_client'; use off, always-ask or auto."; exit 1 ;;
+          esac
+          {
+            echo "verify_dev=$VERIFY_DEV"
+            echo "verify_test=$VERIFY_TEST"
+            echo "verify_live=$VERIFY_LIVE"
+            echo "notify_client=$notify_client"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "| Gate | Mode |"
+            echo "|---|---|"
+            echo "| dev | \`$VERIFY_DEV\` |"
+            echo "| test | \`$VERIFY_TEST\`${test_note} |"
+            echo "| live | \`$VERIFY_LIVE\` |"
+            echo "| client email | \`$notify_client\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Slack: also ships'
+        if: steps.also.outputs.total > 0
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ steps.find.outputs.pr_number }}
+          kind: info
+          stage: test
+          text: >-
+            Releasing with ${{ steps.also.outputs.total }} other commit(s) not on live yet (${{ steps.also.outputs.site }} affecting the site).${{ steps.also.outputs.site > 0 && ' The test gate will ask before live.' || '' }} <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+      - name: Slack
+        if: steps.find.outputs.dev_only_stop == 'true'
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ steps.find.outputs.pr_number }}
+          kind: info
+          stage: dev
+          text: >-
+            Dev-only update: stopped after the merge; live code wouldn't change. To release it anyway, run *${{ github.workflow }}* by hand with _Release a dev-only update_. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+  # Dev ----------------------------------------------------------------------
+
+  smoke-dev:
+    name: Smoke test dev
+    needs: resolve
+    if: needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.smoke.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ${{ inputs.smoke_test_config }}
+          sparse-checkout-cone-mode: false
+      - id: smoke
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+        with:
+          environment: dev
+          mode: check
+          config: ${{ inputs.smoke_test_config }}
+          fail_on_failure: 'false'
+          basic_auth_user: ${{ secrets.BASIC_AUTH_USER }}
+          basic_auth_password: ${{ secrets.BASIC_AUTH_PASSWORD }}
+
+  notify-verify-dev:
+    name: Ask for dev approval
+    needs: [resolve, smoke-dev]
+    if: >-
+      always() && needs.smoke-dev.result == 'success' && (
+        needs.resolve.outputs.verify_dev == 'always-ask' ||
+        (needs.resolve.outputs.verify_dev == 'ask-on-failure' && needs.smoke-dev.outputs.result != 'passed')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: approval
+          stage: dev
+          text: >-
+            :raised_hand: Approval needed: *verify dev* (smoke test: ${{ needs.smoke-dev.outputs.result }}). <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+  verify-dev:
+    name: Verify dev
+    needs: [resolve, smoke-dev]
+    if: >-
+      always() && needs.smoke-dev.result == 'success' && (
+        needs.resolve.outputs.verify_dev == 'always-ask' ||
+        (needs.resolve.outputs.verify_dev == 'ask-on-failure' && needs.smoke-dev.outputs.result != 'passed')
+      )
+    runs-on: ubuntu-latest
+    environment: security-update-verify-dev
+    steps:
+      - run: echo "Dev approved (smoke test ${{ needs.smoke-dev.outputs.result }})."
+
+  # Test ---------------------------------------------------------------------
+
+  release-test:
+    name: Release dev to test
+    needs: [resolve, smoke-dev, verify-dev]
+    if: >-
+      always() && needs.resolve.outputs.proceed == 'true' && (
+        needs.verify-dev.result == 'success' ||
+        (needs.verify-dev.result == 'skipped' && needs.smoke-dev.outputs.result == 'passed')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Write: starts the repository's release workflow.
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      finished_at: ${{ steps.release.outputs.finished_at }}
+    steps:
+      - name: Run ${{ inputs.release_to_test }} and wait
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ inputs.release_to_test }}
+          REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          started=$(date -u +%FT%TZ)
+          # return_run_details makes the API answer with the new run's ID.
+          response=$(gh api -X POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" \
+            -f ref="$REF" -F return_run_details=true)
+          run_id=$(jq -r '.workflow_run_id // empty' <<< "$response" 2>/dev/null || true)
+          if [ -z "$run_id" ]; then
+            # Without run details, find the run by when it was created.
+            for _ in $(seq 1 24); do
+              sleep 5
+              run_id=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?event=workflow_dispatch&created=%3E%3D$started" \
+                --jq '.workflow_runs | sort_by(.created_at) | .[0].id // empty')
+              [ -z "$run_id" ] || break
+            done
+          fi
+          if [ -z "$run_id" ]; then
+            echo "::error::Started $WORKFLOW, but couldn't find its run."
+            exit 1
+          fi
+          url="$GITHUB_SERVER_URL/$REPO/actions/runs/$run_id"
+          echo "Waiting on $WORKFLOW: $url"
+          while :; do
+            sleep 15
+            run=$(gh api "repos/$REPO/actions/runs/$run_id")
+            [ "$(jq -r .status <<< "$run")" = "completed" ] && break
+          done
+          conclusion=$(jq -r .conclusion <<< "$run")
+          echo "Release to test: **${conclusion}** ([${WORKFLOW}](${url}))" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::$WORKFLOW finished with '$conclusion': $url"
+            exit 1
+          fi
+          echo "finished_at=$(jq -r .updated_at <<< "$run")" >> "$GITHUB_OUTPUT"
+
+  smoke-test:
+    name: Smoke test test
+    needs: release-test
+    if: always() && needs.release-test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.smoke.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ${{ inputs.smoke_test_config }}
+          sparse-checkout-cone-mode: false
+      - id: smoke
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+        with:
+          environment: test
+          mode: check
+          config: ${{ inputs.smoke_test_config }}
+          fail_on_failure: 'false'
+          basic_auth_user: ${{ secrets.BASIC_AUTH_USER }}
+          basic_auth_password: ${{ secrets.BASIC_AUTH_PASSWORD }}
+
+  notify-verify-test:
+    name: Ask for test approval
+    needs: [resolve, smoke-test]
+    if: >-
+      always() && needs.smoke-test.result == 'success' && (
+        needs.resolve.outputs.verify_test == 'always-ask' ||
+        (needs.resolve.outputs.verify_test == 'ask-on-failure' && needs.smoke-test.outputs.result != 'passed')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: approval
+          stage: test
+          text: >-
+            :raised_hand: Approval needed: *verify test* (smoke test: ${{ needs.smoke-test.outputs.result }}). <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+  verify-test:
+    name: Verify test
+    needs: [resolve, smoke-test]
+    if: >-
+      always() && needs.smoke-test.result == 'success' && (
+        needs.resolve.outputs.verify_test == 'always-ask' ||
+        (needs.resolve.outputs.verify_test == 'ask-on-failure' && needs.smoke-test.outputs.result != 'passed')
+      )
+    runs-on: ubuntu-latest
+    environment: security-update-verify-test
+    steps:
+      - run: echo "Test approved for release to live (smoke test ${{ needs.smoke-test.outputs.result }})."
+
+  # Live ---------------------------------------------------------------------
+
+  baseline-live:
+    name: Baseline live
+    needs: [resolve, smoke-test, verify-test]
+    if: >-
+      always() && needs.resolve.outputs.proceed == 'true' && needs.smoke-test.result == 'success' && (
+        needs.verify-test.result == 'success' ||
+        (needs.verify-test.result == 'skipped' && needs.smoke-test.outputs.result == 'passed')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.smoke.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ${{ inputs.smoke_test_config }}
+          sparse-checkout-cone-mode: false
+      - id: smoke
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+        with:
+          environment: live
+          mode: baseline
+          config: ${{ inputs.smoke_test_config }}
+          # Live already failing its checks: stop before releasing to it.
+          fail_on_failure: 'true'
+          basic_auth_user: ${{ secrets.BASIC_AUTH_USER }}
+          basic_auth_password: ${{ secrets.BASIC_AUTH_PASSWORD }}
+
+  release-live:
+    name: Release test to live
+    needs: baseline-live
+    if: always() && needs.baseline-live.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Write: starts the repository's release workflow.
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      finished_at: ${{ steps.release.outputs.finished_at }}
+    steps:
+      - name: Run ${{ inputs.release_to_live }} and wait
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ inputs.release_to_live }}
+          REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          started=$(date -u +%FT%TZ)
+          # return_run_details makes the API answer with the new run's ID.
+          response=$(gh api -X POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" \
+            -f ref="$REF" -F return_run_details=true)
+          run_id=$(jq -r '.workflow_run_id // empty' <<< "$response" 2>/dev/null || true)
+          if [ -z "$run_id" ]; then
+            # Without run details, find the run by when it was created.
+            for _ in $(seq 1 24); do
+              sleep 5
+              run_id=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?event=workflow_dispatch&created=%3E%3D$started" \
+                --jq '.workflow_runs | sort_by(.created_at) | .[0].id // empty')
+              [ -z "$run_id" ] || break
+            done
+          fi
+          if [ -z "$run_id" ]; then
+            echo "::error::Started $WORKFLOW, but couldn't find its run."
+            exit 1
+          fi
+          url="$GITHUB_SERVER_URL/$REPO/actions/runs/$run_id"
+          echo "Waiting on $WORKFLOW: $url"
+          while :; do
+            sleep 15
+            run=$(gh api "repos/$REPO/actions/runs/$run_id")
+            [ "$(jq -r .status <<< "$run")" = "completed" ] && break
+          done
+          conclusion=$(jq -r .conclusion <<< "$run")
+          echo "Release to live: **${conclusion}** ([${WORKFLOW}](${url}))" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::$WORKFLOW finished with '$conclusion': $url"
+            exit 1
+          fi
+          echo "finished_at=$(jq -r .updated_at <<< "$run")" >> "$GITHUB_OUTPUT"
+
+  compare-live:
+    name: Smoke test live
+    needs: release-live
+    if: always() && needs.release-live.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.smoke.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ${{ inputs.smoke_test_config }}
+          sparse-checkout-cone-mode: false
+      - id: smoke
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+        with:
+          environment: live
+          mode: compare
+          config: ${{ inputs.smoke_test_config }}
+          fail_on_failure: 'false'
+          basic_auth_user: ${{ secrets.BASIC_AUTH_USER }}
+          basic_auth_password: ${{ secrets.BASIC_AUTH_PASSWORD }}
+
+  notify-verify-live:
+    name: Ask for live approval
+    needs: [resolve, compare-live]
+    if: >-
+      always() && needs.compare-live.result == 'success' && (
+        needs.resolve.outputs.verify_live == 'always-ask' ||
+        (needs.resolve.outputs.verify_live == 'ask-on-failure' && needs.compare-live.outputs.result != 'passed')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: approval
+          stage: live
+          text: >-
+            :raised_hand: Approval needed: *verify live* (smoke test: ${{ needs.compare-live.outputs.result }}). <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+  verify-live:
+    name: Verify live
+    needs: [resolve, compare-live]
+    if: >-
+      always() && needs.compare-live.result == 'success' && (
+        needs.resolve.outputs.verify_live == 'always-ask' ||
+        (needs.resolve.outputs.verify_live == 'ask-on-failure' && needs.compare-live.outputs.result != 'passed')
+      )
+    runs-on: ubuntu-latest
+    environment: security-update-verify-live
+    steps:
+      - run: echo "Live confirmed (smoke test ${{ needs.compare-live.outputs.result }})."
+
+  # Report -------------------------------------------------------------------
+
+  report:
+    name: Report
+    needs: [resolve, smoke-dev, verify-dev, release-test, smoke-test, verify-test, baseline-live, release-live, compare-live, verify-live]
+    if: always() && needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      outcome: ${{ steps.outcome.outputs.kind }}
+      live_at: ${{ steps.outcome.outputs.live_at }}
+      reviewed: ${{ steps.outcome.outputs.reviewed }}
+    steps:
+      - name: Summarize
+        id: outcome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          VERIFY_LIVE: ${{ needs.resolve.outputs.verify_live }}
+          SMOKE_DEV: ${{ needs.smoke-dev.outputs.result || needs.smoke-dev.result }}
+          VERIFY_DEV: ${{ needs.verify-dev.result }}
+          RELEASE_TEST: ${{ needs.release-test.result }}
+          SMOKE_TEST: ${{ needs.smoke-test.outputs.result || needs.smoke-test.result }}
+          VERIFY_TEST: ${{ needs.verify-test.result }}
+          BASELINE_LIVE: ${{ needs.baseline-live.result }}
+          RELEASE_LIVE: ${{ needs.release-live.result }}
+          COMPARE_LIVE: ${{ needs.compare-live.outputs.result || needs.compare-live.result }}
+          VERIFY_LIVE_RESULT: ${{ needs.verify-live.result }}
+          LIVE_AT: ${{ needs.release-live.outputs.finished_at }}
+        run: |
+          {
+            echo "### Security update: release #${PR_NUMBER}"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Smoke test dev | ${SMOKE_DEV} |"
+            echo "| Verify dev | ${VERIFY_DEV} |"
+            echo "| Release dev to test | ${RELEASE_TEST} |"
+            echo "| Smoke test test | ${SMOKE_TEST} |"
+            echo "| Verify test | ${VERIFY_TEST} |"
+            echo "| Baseline live | ${BASELINE_LIVE} |"
+            echo "| Release test to live | ${RELEASE_LIVE} |"
+            echo "| Smoke test live | ${COMPARE_LIVE} |"
+            echo "| Verify live | ${VERIFY_LIVE_RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Live is confirmed by a passing smoke test (unless the gate is
+          # always-ask) or by an approval.
+          if [ "$VERIFY_LIVE_RESULT" = "success" ] || { [ "$COMPARE_LIVE" = "passed" ] && [ "$VERIFY_LIVE" != "always-ask" ]; }; then
+            echo "Released to live and confirmed." >> "$GITHUB_STEP_SUMMARY"
+            reviewed=false
+            for result in "$VERIFY_DEV" "$VERIFY_TEST" "$VERIFY_LIVE_RESULT"; do
+              [ "$result" = "success" ] && reviewed=true
+            done
+            {
+              echo "live_at=${LIVE_AT:-$(date -u +%FT%TZ)}"
+              echo "reviewed=$reviewed"
+              echo "kind=success"
+              echo "text=:white_check_mark: Live and confirmed."
+            } >> "$GITHUB_OUTPUT"
+          elif [ "$RELEASE_LIVE" = "success" ]; then
+            {
+              echo "kind=alert"
+              echo "text=:rotating_light: Released to LIVE, but live wasn't confirmed (smoke test: ${COMPARE_LIVE}, verify: ${VERIFY_LIVE_RESULT}). Check the site now."
+            } >> "$GITHUB_OUTPUT"
+          else
+            if [ "$RELEASE_TEST" != "success" ]; then
+              stage="dev"
+            else
+              stage="test"
+            fi
+            {
+              echo "kind=failure"
+              echo "stage=$stage"
+              echo "text=:x: Release stopped before live, at $stage."
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+
+      - name: Slack
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: ${{ steps.outcome.outputs.kind }}
+          stage: ${{ steps.outcome.outputs.stage || 'live' }}
+          text: >-
+            ${{ steps.outcome.outputs.text }}
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+      - name: Fail if live wasn't confirmed
+        if: steps.outcome.outputs.kind != 'success'
+        env:
+          KIND: ${{ steps.outcome.outputs.kind }}
+        run: |
+          if [ "$KIND" = "alert" ]; then
+            echo "::error::Released to live, but live wasn't confirmed. Check the site now."
+          else
+            echo "::error::The release stopped before live. See the stages above."
+          fi
+          exit 1
+
+  # Client email ---------------------------------------------------------------
+  # Only after live is confirmed, and only when SECURITY_UPDATE_NOTIFY_CLIENT's
+  # mode isn't off. always-ask waits on security-update-notify-client; auto
+  # sends straight away (an environment's approval can't be made optional).
+
+  client-email-preview:
+    name: Build the client email
+    needs: [resolve, report]
+    if: always() && needs.report.outputs.outcome == 'success' && needs.resolve.outputs.notify_client != 'off'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the client email
+        id: email
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@v1
+        with:
+          notify_config: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
+          email_config: ${{ vars.SECURITY_UPDATE_EMAIL }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          github_token: ${{ github.token }}
+          live_at: ${{ needs.report.outputs.live_at }}
+          reviewed: ${{ needs.report.outputs.reviewed }}
+          send: 'false'
+      - name: 'Slack: approval needed'
+        if: needs.resolve.outputs.notify_client == 'always-ask'
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: approval
+          stage: email
+          text: >-
+            :email: Client email ready for ${{ steps.email.outputs.recipients }} recipient(s): _${{ steps.email.outputs.subject }}_. Approval needed: *notify client*. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+  client-email:
+    name: Send the client email (approved)
+    needs: [resolve, report, client-email-preview]
+    if: always() && needs.client-email-preview.result == 'success' && needs.resolve.outputs.notify_client == 'always-ask'
+    environment: security-update-notify-client
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send the client email
+        id: email
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@v1
+        with:
+          notify_config: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
+          email_config: ${{ vars.SECURITY_UPDATE_EMAIL }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          github_token: ${{ github.token }}
+          live_at: ${{ needs.report.outputs.live_at }}
+          reviewed: ${{ needs.report.outputs.reviewed }}
+          send: 'true'
+          mailgun_key: ${{ secrets.LABBY_MAILGUN_SENDING_KEY }}
+          mailgun_domain: ${{ vars.MAILGUN_DOMAIN }}
+          mailgun_api_base: ${{ vars.MAILGUN_API_BASE }}
+      - name: 'Slack: sent'
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: info
+          stage: email
+          text: >-
+            :email: Client email sent to ${{ steps.email.outputs.recipients }} recipient(s): _${{ steps.email.outputs.subject }}_.
+      - name: 'Slack: not sent'
+        if: failure()
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: failure
+          stage: email
+          text: >-
+            :x: Client email failed to send. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+  client-email-auto:
+    name: Send the client email
+    needs: [resolve, report, client-email-preview]
+    if: always() && needs.client-email-preview.result == 'success' && needs.resolve.outputs.notify_client == 'auto'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send the client email
+        id: email
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-client-email@v1
+        with:
+          notify_config: ${{ vars.SECURITY_UPDATE_NOTIFY_CLIENT }}
+          email_config: ${{ vars.SECURITY_UPDATE_EMAIL }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          github_token: ${{ github.token }}
+          live_at: ${{ needs.report.outputs.live_at }}
+          reviewed: ${{ needs.report.outputs.reviewed }}
+          send: 'true'
+          mailgun_key: ${{ secrets.LABBY_MAILGUN_SENDING_KEY }}
+          mailgun_domain: ${{ vars.MAILGUN_DOMAIN }}
+          mailgun_api_base: ${{ vars.MAILGUN_API_BASE }}
+      - name: 'Slack: sent'
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: info
+          stage: email
+          text: >-
+            :email: Client email sent to ${{ steps.email.outputs.recipients }} recipient(s): _${{ steps.email.outputs.subject }}_.
+      - name: 'Slack: not sent'
+        if: failure()
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ github.token }}
+          pr_number: ${{ needs.resolve.outputs.pr_number }}
+          kind: failure
+          stage: email
+          text: >-
+            :x: Client email failed to send. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
