@@ -51,7 +51,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - id: smoke
-        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@v1
+        uses: daggerhartlab/devops-shared-actions/.github/actions/website-smoke-test@security-update
         with:
           environment: ${{ inputs.environment }}
           mode: ${{ inputs.mode }}

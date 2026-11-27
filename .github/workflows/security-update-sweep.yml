@@ -178,7 +178,7 @@ jobs:
         item: ${{ fromJSON(needs.find.outputs.items) }}
     steps:
       - name: Slack
-        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@security-update
         with:
           slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
           channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
