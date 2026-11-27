@@ -1260,7 +1260,7 @@ Link the issue the usual way: a closing keyword in the PR description
 (`Fixes #42`, `Closes #42`, `Resolves #42`) or the Development sidebar.
 Claude gets, for up to five linked issues in the same repository, each one's
 title, state, description and newest 20 comments, plus its milestone and its
-parent issue's title and description, about 40 KB in all. With no linked
+parent issue's title and description, about 40,000 characters in all. With no linked
 issue, or if they can't be read, the review runs exactly as `claude-review`
 does, with a warning in the second case. The job summary lists the issues
 used.
@@ -1272,6 +1272,9 @@ used.
 - **A bare `#42` isn't a link.** Only closing keywords and sidebar links
   count, the same ones that close the issue on merge. Issues in other
   repositories are skipped.
+- **Closing keywords only link PRs into the default branch.** GitHub ignores
+  `Fixes #42` in a PR that targets any other branch, such as a release
+  branch or a stacked PR's base, so that PR is reviewed without the issue.
 - **One unreadable parent drops them all.** If a linked issue's parent is in
   a private repository this repo's token can't read, GitHub fails the whole
   request, and the review runs without any issues, with a warning.
@@ -1318,3 +1321,10 @@ Credentialed paths (SSH, Terminus, Acquia CLI) are intentionally untested —
 they need live secrets and can't run on PRs from forks. The same goes for
 `claude-review`, which `lint` checks but nothing runs; test it on `daglab`
 against a branch ref before moving `v1`.
+
+`claude-review-github-issues` calls `claude-review` at `@v1`, because inside
+a called workflow `./` is the caller's repo. A branch test of the wrapper
+therefore runs the released core. To test both, temporarily point the
+wrapper's inner `uses:` at the branch ref, and revert it before merging.
+Test it on a repo that tracks work in GitHub issues, such as `lark`, with
+one PR that links an issue and one that doesn't.
