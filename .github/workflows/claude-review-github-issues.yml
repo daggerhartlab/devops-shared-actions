@@ -1,0 +1,194 @@
+name: Claude code review with GitHub issues
+
+# Reusable workflow for repos that track work in GitHub issues. Fetches the
+# issues a PR is linked to, then runs claude-review.yml with them. The caller
+# owns the triggers and must grant contents: read, pull-requests: write and
+# issues: read.
+#
+# Pass-through only, never logic: inputs and secrets mirror claude-review.yml
+# exactly (test.yml checks this), and anything review-related belongs there.
+on:
+  workflow_call:
+    inputs:
+      include_paths:
+        description: 'Paths to review, one git glob per line, relative to the repo root (e.g. wp-content/themes/my-theme/**). Leave unset to review the whole repo. exclude_paths still applies within these.'
+        type: string
+        required: false
+        default: ''
+      exclude_paths:
+        description: 'Paths left out of the review, one git glob per line, relative to the repo root (e.g. web/modules/custom/*/lark_exports/**). A PR that only touches excluded paths is not reviewed.'
+        type: string
+        required: false
+        default: ''
+      model:
+        description: 'Claude model to review with, as a model ID or an alias (opus, sonnet, haiku). Pass an empty string for the claude-code-action default.'
+        type: string
+        required: false
+        default: 'claude-opus-5-5'
+      effort:
+        description: 'Effort level for the review (low, medium, high, xhigh, max). Pass an empty string for the Claude Code default.'
+        type: string
+        required: false
+        default: 'medium'
+      timeout_minutes:
+        description: 'Job timeout in minutes.'
+        type: number
+        required: false
+        default: 20
+      jira_url:
+        description: 'Jira site the PR''s ticket is read from, when the Jira secrets are set. Only ticket links on this site are followed.'
+        type: string
+        required: false
+        default: 'https://daggerhart.atlassian.net'
+      composer_dirs:
+        description: 'Directories to run composer install in, without scripts, one per line, relative to the repo root (. for the root, or a theme with its own lock), so Claude can read the dependencies (vendor/, contrib modules, plugins) the PR code calls. A failed install only skips that directory. Leave unset to skip.'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      JIRA_EMAIL:
+        description: 'Email of the Jira account that reads tickets. Leave unset to review without the ticket.'
+        required: false
+      JIRA_API_TOKEN:
+        description: 'Scoped Jira API token with read:jira-work for that account.'
+        required: false
+      COMPOSER_AUTH:
+        description: 'Composer auth JSON for private packages, used by composer_dirs.'
+        required: false
+
+jobs:
+  issues:
+    # Same condition as the review job, so other comments skip the fetch.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: read
+      pull-requests: read
+    outputs:
+      markdown: ${{ steps.fetch.outputs.markdown }}
+    env:
+      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+    steps:
+      # Never fails the job: without the issues, Claude reviews the code
+      # alone. Closing keywords (Fixes #12) and sidebar links only, up to
+      # five issues, in this repository.
+      - name: Fetch the linked issues
+        id: fetch
+        # pipefail, so a failed jq reaches skip().
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          max=5
+          budget=40000
+          skip() {
+            echo "::warning::Couldn't read the PR's linked issues ($1); reviewing without them."
+            exit 0
+          }
+
+          # shellcheck disable=SC2016 # GraphQL variables, not shell.
+          gh api graphql \
+            -F owner="${REPO%%/*}" -F name="${REPO#*/}" -F pr="$PR" -F max="$max" \
+            -f query='
+              query($owner: String!, $name: String!, $pr: Int!, $max: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    closingIssuesReferences(first: $max) {
+                      totalCount
+                      nodes {
+                        number title state body
+                        repository { nameWithOwner }
+                        milestone { title description dueOn }
+                        parent { number title body repository { nameWithOwner } }
+                        comments(last: 20) {
+                          totalCount
+                          nodes { author { login } createdAt body }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' > "$RUNNER_TEMP/issues.json" || skip "request failed"
+
+          # Same-repo issues only: each with its state, milestone, parent issue and
+          # newest comments. The cut catches oversized issues.
+          jq -r --arg repo "$REPO" --argjson max "$max" '
+            .data.repository.pullRequest.closingIssuesReferences as $r
+            | [$r.nodes[] | select(.repository.nameWithOwner == $repo)] as $issues
+            | ($r.totalCount - ($issues | length)) as $left
+            | if ($issues | length) == 0 then empty else
+                (if $left > 0 then "(\($left) linked issue(s) not included: in another repository, or over the limit of \($max).)\n" else empty end),
+                ($issues[]
+                  | (if .parent == null then ""
+                     elif .parent.repository.nameWithOwner == $repo then "#\(.parent.number)"
+                     else "\(.parent.repository.nameWithOwner)#\(.parent.number)" end) as $parent
+                  | "# #\(.number): \(.title)\n\n"
+                    + "State: \(.state)."
+                    + (if .milestone then " Milestone: \(.milestone.title)\(if .milestone.dueOn then ", due \(.milestone.dueOn[0:10])" else "" end)." else "" end)
+                    + (if .parent then " Parent: \($parent) \(.parent.title)." else "" end)
+                    + "\n\n## Description\n\n\(if (.body // "") == "" then "(none)" else .body end)\n"
+                    + (if (.milestone.description // "") != "" then "\n## Milestone \(.milestone.title)\n\n\(.milestone.description)\n" else "" end)
+                    + (if .parent then "\n## Parent issue \($parent): \(.parent.title)\n\n\(if (.parent.body // "") == "" then "(none)" else .parent.body end)\n" else "" end)
+                    + (if .comments.totalCount > 0 then
+                        "\n## Comments\n"
+                        + (if .comments.totalCount > (.comments.nodes | length) then "\n(\(.comments.totalCount - (.comments.nodes | length)) older comment(s) not included.)\n" else "" end)
+                        + ([.comments.nodes[] | "\n### \(.author.login // "ghost"), \(.createdAt[0:10])\n\n\(.body)\n"] | join(""))
+                      else "" end)
+                    + "\n---\n")
+              end
+          ' "$RUNNER_TEMP/issues.json" \
+            | perl -CSD -0pe "\$_ = substr(\$_, 0, $budget) . \"\n\n[Truncated.]\n\" if length > $budget" \
+            > "$RUNNER_TEMP/issues.md" || skip "unexpected response"
+
+          if [ ! -s "$RUNNER_TEMP/issues.md" ]; then
+            echo "No linked issues in this repository."
+            exit 0
+          fi
+
+          numbers=$(jq -r --arg repo "$REPO" '[.data.repository.pullRequest.closingIssuesReferences.nodes[]
+            | select(.repository.nameWithOwner == $repo) | "#\(.number)"] | join(" ")' "$RUNNER_TEMP/issues.json")
+          delim="ISSUES_$(openssl rand -hex 16)"
+          {
+            echo "markdown<<$delim"
+            cat "$RUNNER_TEMP/issues.md"
+            echo "$delim"
+            echo "numbers=$numbers"
+          } >> "$GITHUB_OUTPUT"
+          echo "Linked issues: $numbers"
+          echo "Linked issues: $numbers" >> "$GITHUB_STEP_SUMMARY"
+
+  review:
+    needs: issues
+    # Also after a skipped or failed fetch; the review job applies its own
+    # condition.
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      pull-requests: write
+    # Pinned: inside a called workflow, ./ is the caller's repo.
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review.yml@v1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+    with:
+      include_paths: ${{ inputs.include_paths }}
+      exclude_paths: ${{ inputs.exclude_paths }}
+      model: ${{ inputs.model }}
+      effort: ${{ inputs.effort }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      jira_url: ${{ inputs.jira_url }}
+      composer_dirs: ${{ inputs.composer_dirs }}
+      github_issues: ${{ needs.issues.outputs.markdown }}

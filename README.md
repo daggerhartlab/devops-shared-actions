@@ -40,6 +40,9 @@ Reusable workflows:
 - [`claude-review`](#claude-review) — reviews pull requests with Claude,
   following the consumer's `REVIEW.md`, and re-reviews on an `@claude`
   comment.
+- [`claude-review-github-issues`](#claude-review-github-issues) — the same
+  review, plus the GitHub issues the PR is linked to, for repos that track
+  work in GitHub issues instead of Jira.
 
 The actions are composite actions; see each `action.yml` (or the workflow
 file) for the full, authoritative list of inputs and defaults. This README
@@ -1062,7 +1065,8 @@ Without one, Claude reports only correctness bugs and security issues.
 Inputs: `include_paths` (default: the whole repo), `exclude_paths` (default
 none), `model` (default `claude-opus-5-5`), `effort` (default `medium`),
 `timeout_minutes` (default `20`), `jira_url` (default `https://daggerhart.atlassian.net`),
-`composer_dirs` (default none).
+`composer_dirs` (default none). `github_issues` is set by
+[`claude-review-github-issues`](#claude-review-github-issues); leave it unset.
 Secrets: `CLAUDE_CODE_OAUTH_TOKEN`, required; `JIRA_EMAIL`,
 `JIRA_API_TOKEN`, and `COMPOSER_AUTH`, optional.
 
@@ -1195,8 +1199,8 @@ Use the path inputs for whole files that should never be reviewed, and
   removed before the review, so keep third-party code out of scope with
   `include_paths` or `exclude_paths`.
 - **Claude can only read.** It reads the checkout (not `.git`) and the
-  files the workflow prepares for it: the diff, the PR conversation, and
-  the Jira ticket. It
+  files the workflow prepares for it: the diff, the PR conversation, the
+  Jira ticket, and any GitHub issues. It
   has no shell, can't write, and can't read elsewhere on the runner. It
   returns its comments, and the workflow posts them as one review, with
   images, embedded HTML, HTML comments, and token-like strings removed. If
@@ -1214,6 +1218,69 @@ Use the path inputs for whole files that should never be reviewed, and
   secrets. A maintainer's `@claude` on one does review it, reading the
   fork's code; Claude can only read, so that's safe, but the fork's text
   can still try to steer the review.
+
+## `claude-review-github-issues`
+
+A reusable workflow for repos that track work in GitHub issues, such as
+custom modules and plugins. It reads the issues a PR is linked to, then runs
+[`claude-review`](#claude-review) with them; Claude uses them the way it
+uses a Jira ticket, listing requirements the diff misses or contradicts in
+the summary. Everything else, including inputs, secrets, `REVIEW.md` and
+the gotchas, is `claude-review`'s.
+
+```yaml
+name: Claude code review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+jobs:
+  review:
+    uses: daggerhartlab/devops-shared-actions/.github/workflows/claude-review-github-issues.yml@v1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LABBY_CLAUDE_CODE_OAUTH_TOKEN }}
+    with:
+      exclude_paths: |
+        **/composer.lock
+```
+
+Compared with a `claude-review` caller: `issues: read` is added, the
+`uses:` path names this workflow, and the Jira secrets are usually left out.
+Every `claude-review` input and secret works the same.
+
+Link the issue the usual way: a closing keyword in the PR description
+(`Fixes #42`, `Closes #42`, `Resolves #42`) or the Development sidebar.
+Claude gets, for up to five linked issues in the same repository, each one's
+title, state, description and newest 20 comments, plus its milestone and its
+parent issue's title and description, about 40,000 characters in all. With no linked
+issue, or if they can't be read, the review runs exactly as `claude-review`
+does, with a warning in the second case. The job summary lists the issues
+used.
+
+### Gotchas
+
+- **`issues: read` is required.** Without it the run fails at startup, before
+  any job starts: a reusable workflow can't get more than its caller grants.
+- **A bare `#42` isn't a link.** Only closing keywords and sidebar links
+  count, the same ones that close the issue on merge. Issues in other
+  repositories are skipped.
+- **Closing keywords only link PRs into the default branch.** GitHub ignores
+  `Fixes #42` in a PR that targets any other branch, such as a release
+  branch or a stacked PR's base, so that PR is reviewed without the issue.
+- **One unreadable parent drops them all.** If a linked issue's parent is in
+  a private repository this repo's token can't read, GitHub fails the whole
+  request, and the review runs without any issues, with a warning.
+- **Projects, discussions and wiki pages aren't read.** Projects aren't
+  available to `GITHUB_TOKEN` at all, and the others are rarely linked from a
+  PR. Put requirements in the issue.
 
 ## Testing
 
@@ -1235,6 +1302,7 @@ once `v1` is moved onto it.
 | `wp-plugin-version` | Builds a plugin fixture with a decoy `Version:` line and a vendored `Plugin Name:` header, runs with `dry_run`, asserts only the first match is rewritten, the entry file is discovered correctly, and the tag is created on the packaging commit; that an already-bumped header is tagged without a new commit; that an existing tag, a lower version, a run off the primary branch, and two root-level entry files are all refused; and that `plugin_file` resolves the ambiguity |
 | `composer-audit` | Audits a hand-written lock with a known-vulnerable package, asserts the dev package is included by default and excluded with `no_dev`, that a clean lock reports zero, that a missing lock fails, and that several directories total their counts while a missing one fails only after the rest report; then, offline, pins the Fixed in result for every range shape seen in real reports (`\|\|` and `\|`, comma and space, `v` prefixes, `<=`, no upper bound, end-to-end ranges, unparseable), that an unusable report fails with a summary, and the per-directory headings of a multi-location summary |
 | `composer-diff` | Builds base and changed fixture commits, runs with `dry_run` across three lock files, asserts each is named, the changed tables are present, an unchanged lock collapses to one line, and a new lock shows its packages as new; that an unchanged-only run reports `changed=false`; and that a directory with no lock and a base missing from the checkout both fail |
+| `claude-review-github-issues` | Checks the wrapper declares exactly `claude-review`'s inputs and secrets (minus `github_issues`) and passes each one through, and that its fetch job has the review job's condition; then runs the fetch step against fixture GraphQL responses, asserting milestones, same- and cross-repo parents, the older-comments note, that other repositories' issues are skipped, that an oversized issue is cut, and that no issues, a failed request, or a response it can't render give no output (the latter two with a warning) |
 
 Two things worth knowing if you extend this:
 
@@ -1253,3 +1321,10 @@ Credentialed paths (SSH, Terminus, Acquia CLI) are intentionally untested —
 they need live secrets and can't run on PRs from forks. The same goes for
 `claude-review`, which `lint` checks but nothing runs; test it on `daglab`
 against a branch ref before moving `v1`.
+
+`claude-review-github-issues` calls `claude-review` at `@v1`, because inside
+a called workflow `./` is the caller's repo. A branch test of the wrapper
+therefore runs the released core. To test both, temporarily point the
+wrapper's inner `uses:` at the branch ref, and revert it before merging.
+Test it on a repo that tracks work in GitHub issues, such as `lark`, with
+one PR that links an issue and one that doesn't.
