@@ -1,0 +1,315 @@
+name: Security update
+
+# Reusable workflow. Updates only the Composer packages `composer audit` flags,
+# then opens a PR on security-update/<date> as Daggerhart Labby, so the PR's
+# checks and the merge's deploy run like any other change.
+
+on:
+  workflow_call:
+    inputs:
+      composer_dirs:
+        description: 'Composer roots to audit, one per line, relative to the repository'
+        type: string
+        default: '.'
+      php_version:
+        description: 'PHP version for Composer'
+        type: string
+        default: '8.3'
+      dry_run:
+        description: 'Report what would change without pushing or opening a PR'
+        type: boolean
+        default: false
+    secrets:
+      LABBY_APP_ID:
+        required: true
+      LABBY_APP_PRIVATE_KEY:
+        required: true
+      LABBY_SLACK_BOT_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  COMPOSER_DIRS: ${{ inputs.composer_dirs }}
+  BRANCH_PREFIX: security-update
+
+jobs:
+  update:
+    name: Audit and update
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: security-update
+      cancel-in-progress: false
+    steps:
+      - name: Create Daggerhart Labby token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.LABBY_APP_ID }}
+          private-key: ${{ secrets.LABBY_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: daggerhartlab/devops-shared-actions/.github/actions/setup-runner@v1
+        with:
+          php_version: ${{ inputs.php_version }}
+          node_version: ''
+          composer_github_token: ${{ steps.app-token.outputs.token }}
+
+      - name: Refuse if another security update PR is open
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          branch="${BRANCH_PREFIX}/$(date -u +%F)"
+          echo "BRANCH=$branch" >> "$GITHUB_ENV"
+          other=$(gh pr list --state open --json headRefName,url \
+            --jq "[.[] | select((.headRefName | startswith(\"${BRANCH_PREFIX}/\")) and .headRefName != \"$branch\")] | .[0].url // empty")
+          if [ -n "$other" ]; then
+            echo "::error::Another security update PR is still open: $other. Merge or close it first."
+            exit 1
+          fi
+
+      - name: Audit and update flagged packages
+        id: update
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/report.md"
+          : > "$report"
+          changed=false
+          dev_only=true
+          titles=()
+          advisories=()
+          # Machine-readable update data for the client email.
+          echo '[]' > "$RUNNER_TEMP/data.json"
+
+          while IFS= read -r dir; do
+            [ -n "$dir" ] || continue
+            [ -f "$dir/composer.lock" ] || continue
+
+            # Plugins (e.g. the merge plugin) only load once vendor/ exists.
+            composer install --working-dir="$dir" --no-interaction --no-progress --no-scripts
+
+            before="$RUNNER_TEMP/before.json"
+            composer audit --working-dir="$dir" --locked --format=json --abandoned=ignore > "$before" || true
+            packages=$(jq -r '.advisories // {} | keys[]' "$before")
+            [ -n "$packages" ] || continue
+
+            prod=$(composer audit --working-dir="$dir" --locked --no-dev --format=json --abandoned=ignore | jq -r '.advisories // {} | keys | length' || true)
+            if [ "${prod:-0}" != "0" ]; then
+              dev_only=false
+            fi
+
+            cp "$dir/composer.lock" "$RUNNER_TEMP/lock-before.json"
+            # shellcheck disable=SC2086
+            composer update --working-dir="$dir" $packages --with-all-dependencies --no-interaction --no-progress --no-scripts
+
+            {
+              echo "#### \`${dir}\`"
+              echo ""
+              echo "| Package | From | To | Advisories |"
+              echo "|---|---|---|---|"
+            } >> "$report"
+            for pkg in $packages; do
+              from=$(jq -r --arg p "$pkg" '[.packages[], .["packages-dev"][]?] | map(select(.name == $p))[0].version // "-"' "$RUNNER_TEMP/lock-before.json")
+              to=$(jq -r --arg p "$pkg" '[.packages[], .["packages-dev"][]?] | map(select(.name == $p))[0].version // "removed"' "$dir/composer.lock")
+              ids=$(jq -r --arg p "$pkg" '[.advisories[$p][] | "[\(.cve // .advisoryId)](\(.link))"] | join(", ")' "$before")
+              while IFS= read -r id; do advisories+=("$id"); done < <(jq -r --arg p "$pkg" '.advisories[$p][] | .cve // .advisoryId' "$before")
+              echo "| \`${pkg}\` | \`${from}\` | \`${to}\` | ${ids} |" >> "$report"
+              if [ "$from" != "$to" ]; then
+                titles+=("${pkg} ${from} -> ${to}")
+                jq --arg name "$pkg" --arg from "$from" --arg to "$to" --slurpfile audit "$before" \
+                  '. + [{name: $name, from: $from, to: $to, advisories: [$audit[0].advisories[$name][] | {id: (.cve // .advisoryId), link}]}]' \
+                  "$RUNNER_TEMP/data.json" > "$RUNNER_TEMP/data.next" && mv "$RUNNER_TEMP/data.next" "$RUNNER_TEMP/data.json"
+              fi
+            done
+            echo "" >> "$report"
+
+            if ! git diff --quiet -- "$dir/composer.lock"; then
+              changed=true
+            fi
+
+            after=$(composer audit --working-dir="$dir" --locked --format=json --abandoned=ignore | jq -r '.advisories // {} | keys | join(", ")' || true)
+            if [ -n "$after" ]; then
+              echo "> Still flagged after the update in \`${dir}\`: ${after}. No fixed version is allowed by the constraints." >> "$report"
+              echo "" >> "$report"
+            fi
+          done <<< "$COMPOSER_DIRS"
+
+          joined=$(printf '%s, ' "${titles[@]}")
+          title="Security update: ${joined%, }"
+          ids=$(printf '%s, ' "${advisories[@]}")
+          {
+            echo "changed=$changed"
+            echo "dev_only=$dev_only"
+            echo "title=$title"
+            echo "advisories=${ids%, }"
+          } >> "$GITHUB_OUTPUT"
+          echo "REPORT=$report" >> "$GITHUB_ENV"
+
+      - name: Commit as Daggerhart Labby
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          TITLE: ${{ steps.update.outputs.title }}
+        run: |
+          bot_id=$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git diff --name-only -z -- '*composer.lock' '*composer.json' | xargs -0 git add --
+          git commit -m "$TITLE"
+          git --no-pager log -1 --stat --format='committed %h by %an <%ae>'
+
+      - name: What else ships
+        id: also
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          # Commits on the default branch that live doesn't run yet ship with
+          # this update. Informational only: nothing is blocked.
+          also="$RUNNER_TEMP/also.md"
+          if ! compare=$(gh api "repos/$REPO/compare/deployed/live...$BASE" 2>/dev/null); then
+            echo "Live's commit isn't known yet (no \`deployed/live\` tag), so it can't be listed what else would ship." > "$also"
+            echo "site=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          site=0
+          pipeline=0
+          lines=()
+          while IFS= read -r commit; do
+            sha=$(jq -r .sha <<< "$commit")
+            # Workflow and Tugboat changes don't affect the site.
+            if gh api "repos/$REPO/commits/$sha" --jq '[.files[].filename] | all(startswith(".github/") or startswith(".tugboat/"))' | grep -q true; then
+              pipeline=$((pipeline + 1))
+              note=" (workflow/Tugboat only)"
+            else
+              site=$((site + 1))
+              note=""
+            fi
+            lines+=("- \`${sha:0:9}\` $(jq -r '.commit.message | split("\n")[0]' <<< "$commit")${note}")
+          done < <(jq -c '.commits[] | select((.parents | length) == 1)' <<< "$compare")
+          {
+            if [ $((site + pipeline)) -eq 0 ]; then
+              echo "Nothing else: the default branch matches live."
+            else
+              echo "$((site + pipeline)) other commit(s) on the default branch aren't on live yet and will ship with this update ($site affecting the site):"
+              echo ""
+              printf '%s\n' "${lines[@]}"
+            fi
+          } > "$also"
+          {
+            echo "site=$site"
+            echo "total=$((site + pipeline))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push and open the pull request
+        id: pr
+        if: steps.update.outputs.changed == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TITLE: ${{ steps.update.outputs.title }}
+          DEV_ONLY: ${{ steps.update.outputs.dev_only }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          # The lease compares against our copy of the remote branch, and
+          # checkout only fetched the default branch.
+          git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null || true
+          git push --force-with-lease origin "$BRANCH"
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Updates the Composer packages flagged by \`composer audit\`."
+            echo ""
+            cat "$REPORT"
+            if [ "$DEV_ONLY" = "true" ]; then
+              echo "**Dev-only:** every flagged package is a \`require-dev\` dependency, which the deploy build doesn't install. Live code doesn't change; this stops at the merge."
+            fi
+            echo ""
+            echo "### Also ships with this release"
+            echo ""
+            cat "$RUNNER_TEMP/also.md"
+            echo ""
+            echo "Opened by the [Security update](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) workflow."
+            echo ""
+            echo "<!-- security-update-data: $(jq -c . "$RUNNER_TEMP/data.json") -->"
+          } > "$body"
+
+          existing=$(gh pr list --head "$BRANCH" --state open --json url,body --jq '.[0] // empty')
+          if [ -n "$existing" ]; then
+            url=$(jq -r .url <<< "$existing")
+            # Keep the Slack thread ID saved in the description.
+            jq -r .body <<< "$existing" | grep -oE '<!-- slack-thread: [0-9.]+ -->' >> "$body" || true
+            gh pr edit "$url" --title "$TITLE" --body-file "$body"
+            action=updated
+          else
+            url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$body")
+            action=opened
+          fi
+          {
+            echo "pr_url=$url"
+            echo "pr_number=${url##*/}"
+            echo "action=$action"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Slack
+        if: steps.pr.outputs.pr_number
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          pr_number: ${{ steps.pr.outputs.pr_number }}
+          kind: info
+          stage: update
+          text: >-
+            PR ${{ steps.pr.outputs.action }}${{ steps.update.outputs.advisories && format(' for {0}', steps.update.outputs.advisories) || '' }}.${{ steps.update.outputs.dev_only == 'true' && ' Dev-only: stops at the merge.' || '' }}${{ steps.also.outputs.total > 0 && format(' Also ships {0} other commit(s) not on live yet ({1} affecting the site).', steps.also.outputs.total, steps.also.outputs.site) || '' }}
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+      - name: Slack on failure
+        if: failure()
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          pr_number: ${{ steps.pr.outputs.pr_number }}
+          kind: failure
+          stage: update
+          text: >-
+            :x: Security update workflow failed.
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run>
+
+      - name: Summary
+        if: always()
+        env:
+          CHANGED: ${{ steps.update.outputs.changed }}
+          TITLE: ${{ steps.update.outputs.title }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "### Security update"
+            echo ""
+            if [ "$CHANGED" != "true" ]; then
+              echo "No advisories with an available fix. Nothing to update."
+            else
+              echo "**${TITLE}**"
+              echo ""
+              cat "$REPORT"
+              if [ -n "$PR_URL" ]; then
+                echo "Pull request: ${PR_URL}"
+              elif [ "$DRY_RUN" = "true" ]; then
+                echo "Dry run: nothing pushed."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,166 @@
+name: 'Security update: merge'
+
+# Reusable workflow. Merges an open security-update/* PR once every required
+# check on its head commit has passed. The caller runs it on each status or
+# check-run report, so nothing waits on a runner. Merging as Daggerhart Labby
+# triggers the dev deploy.
+# Merges only when the repository variable SECURITY_UPDATE_AUTO_MERGE_ENABLED
+# is 'true'; otherwise it reports what it would do.
+
+on:
+  workflow_call:
+    inputs:
+      required_checks:
+        description: 'Exact status contexts or check-run names that must succeed, one per line'
+        type: string
+        required: true
+    secrets:
+      LABBY_APP_ID:
+        required: true
+      LABBY_APP_PRIVATE_KEY:
+        required: true
+      LABBY_SLACK_BOT_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REQUIRED_CHECKS: ${{ inputs.required_checks }}
+  BRANCH_PREFIX: security-update/
+
+jobs:
+  merge:
+    # Skip events for commits that aren't on a security update branch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'status' && contains(toJSON(github.event.branches.*.name), 'security-update/')) ||
+      (github.event_name == 'check_run' && startsWith(github.event.check_run.check_suite.head_branch, 'security-update/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: security-update-merge
+      cancel-in-progress: false
+    steps:
+      - name: Create Daggerhart Labby token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.LABBY_APP_ID }}
+          private-key: ${{ secrets.LABBY_APP_PRIVATE_KEY }}
+
+      - name: Evaluate and merge
+        id: evaluate
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          EVENT_SHA: ${{ github.event.sha || github.event.check_run.head_sha }}
+          # Repository variable; anything but 'true' reports without merging.
+          AUTO_MERGE_ENABLED: ${{ vars.SECURITY_UPDATE_AUTO_MERGE_ENABLED }}
+        run: |
+          set -euo pipefail
+          marker='<!-- security-update-merge:failed -->'
+
+          prs=$(gh pr list --repo "$REPO" --state open --json number,headRefName,headRefOid,url \
+            --jq "[.[] | select(.headRefName | startswith(\"$BRANCH_PREFIX\"))]")
+          if [ -n "$EVENT_SHA" ]; then
+            prs=$(jq --arg sha "$EVENT_SHA" '[.[] | select(.headRefOid == $sha)]' <<< "$prs")
+          fi
+          if [ "$(jq length <<< "$prs")" = "0" ]; then
+            echo "No open security update PR at this commit."
+            exit 0
+          fi
+
+          failed_any=false
+          while read -r pr; do
+            number=$(jq -r .number <<< "$pr")
+            sha=$(jq -r .headRefOid <<< "$pr")
+            url=$(jq -r .url <<< "$pr")
+
+            # Latest state per status context, and per check-run name.
+            # Tugboat posts "pending" and "success" in the same second when a
+            # report starts, then the real result minutes later; so among a
+            # context's newest statuses, the worst state wins.
+            states=$( {
+              gh api "repos/$REPO/commits/$sha/statuses" --paginate --jq '.[]' | jq -rs '
+                def rank: {"error": 3, "failure": 3, "pending": 2, "success": 1}[.] // 2;
+                group_by(.context)[]
+                | (map(.created_at) | max) as $newest
+                | [.[] | select(.created_at == $newest)]
+                | max_by(.state | rank)
+                | [.context, .state] | @tsv'
+              gh api "repos/$REPO/commits/$sha/check-runs" --paginate \
+                --jq '.check_runs[] | [.name, (if .status == "completed" then .conclusion else "pending" end)] | @tsv'
+            } )
+
+            pending=()
+            failed=()
+            while IFS= read -r check; do
+              [ -n "$check" ] || continue
+              state=$(awk -F'\t' -v c="$check" '$1 == c { print $2; exit }' <<< "$states")
+              case "${state:-missing}" in
+                success) ;;
+                pending|queued|in_progress|missing) pending+=("$check: ${state:-not reported}") ;;
+                *) failed+=("$check: $state") ;;
+              esac
+            done <<< "$REQUIRED_CHECKS"
+
+            if [ "${#failed[@]}" -gt 0 ]; then
+              failed_any=true
+              echo "::error::#$number has failed required checks: ${failed[*]}"
+              already=$(gh api "repos/$REPO/issues/$number/comments" --jq "[.[] | select(.body | contains(\"$marker\"))] | length")
+              if [ "$already" = "0" ]; then
+                {
+                  echo "$marker"
+                  echo "Not merging: required checks failed on \`${sha:0:9}\`."
+                  echo ""
+                  printf -- '- %s\n' "${failed[@]}"
+                  echo ""
+                  echo "Fix and re-run the checks, or merge by hand if the failure is understood."
+                } | gh pr comment "$number" --repo "$REPO" --body-file -
+                {
+                  echo "notify_pr=$number"
+                  echo "notify_kind=failure"
+                  echo "notify_text=:x: Not merged: required checks failed: ${failed[*]}. <$url|PR>"
+                } >> "$GITHUB_OUTPUT"
+              fi
+              continue
+            fi
+
+            if [ "${#pending[@]}" -gt 0 ]; then
+              echo "#$number waiting on: ${pending[*]}"
+              continue
+            fi
+
+            if [ "$AUTO_MERGE_ENABLED" != "true" ]; then
+              echo "#$number: all required checks passed; would merge, but SECURITY_UPDATE_AUTO_MERGE_ENABLED is not 'true'."
+              echo "Would merge $url (SECURITY_UPDATE_AUTO_MERGE_ENABLED is not 'true')." >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            echo "#$number: all required checks passed; merging."
+            gh pr merge "$number" --repo "$REPO" --merge --match-head-commit "$sha"
+            echo "Merged $url" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "notify_pr=$number"
+              echo "notify_kind=info"
+              echo "notify_text=Merged; deploying to dev."
+            } >> "$GITHUB_OUTPUT"
+          done < <(jq -c '.[]' <<< "$prs")
+
+          if [ "$failed_any" = "true" ]; then
+            exit 1
+          fi
+
+      - name: Slack
+        if: always() && steps.evaluate.outputs.notify_kind
+        uses: daggerhartlab/devops-shared-actions/.github/actions/security-update-slack@v1
+        with:
+          slack_token: ${{ secrets.LABBY_SLACK_BOT_TOKEN }}
+          channel_config: ${{ vars.SECURITY_UPDATE_SLACK_CHANNEL }}
+          mentions_config: ${{ vars.SECURITY_UPDATE_SLACK_MENTIONS }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          pr_number: ${{ steps.evaluate.outputs.notify_pr }}
+          kind: ${{ steps.evaluate.outputs.notify_kind }}
+          stage: merge
+          text: ${{ steps.evaluate.outputs.notify_text }}
